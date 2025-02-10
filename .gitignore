@@ -66,4 +66,7 @@ wheels/
 *.bak
 *.swp
 *.swo
-*~ 
+*~
+
+# NFS temporary files
+.nfs* 

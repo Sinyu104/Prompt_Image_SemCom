@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+
+
+# Virtual Environment
+env/
+prompt_image_segment/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.project
+.pydevproject
+.settings/
+
+# Project specific
+outputs/
+wandb/
+VQAv2/
+checkpoints/
+*.pth
+*.ckpt
+*.pt
+logs/
+*.log
+
+# Data
+*.zip
+*.tar
+*.gz
+*.json
+*.jpg
+*.jpeg
+*.png
+*.npy
+*.npz
+
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Distribution / packaging
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+
+# Temporary files
+*.bak
+*.swp
+*.swo
+*~ 

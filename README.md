@@ -34,8 +34,24 @@ wget https://s3.amazonaws.com/cvmlp/vqa/mscoco/vqa/v2_Questions_Val_mscoco.zip
 wget https://s3.amazonaws.com/cvmlp/vqa/mscoco/vqa/v2_Annotations_Train_mscoco.zip
 wget https://s3.amazonaws.com/cvmlp/vqa/mscoco/vqa/v2_Annotations_Val_mscoco.zip
 
-# Unzip files
+# Download COCO Images
+wget http://images.cocodataset.org/zips/train2014.zip
+wget http://images.cocodataset.org/zips/val2014.zip
+
+# Unzip all files
 unzip "*.zip"
+
+# Clean up zip files
+rm *.zip
+
+# Expected directory structure:
+# VQAv2/
+# ├── train2014/                     # Training images
+# ├── val2014/                       # Validation images
+# ├── v2_OpenEnded_mscoco_train2014_questions.json
+# ├── v2_OpenEnded_mscoco_val2014_questions.json
+# ├── v2_mscoco_train2014_annotations.json
+# └── v2_mscoco_val2014_annotations.json
 ```
 
 ## Usage

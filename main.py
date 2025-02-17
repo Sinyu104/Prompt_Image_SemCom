@@ -43,6 +43,7 @@ from utils import (
     cleanup_distributed,
     visualize_batch
 )
+import math
 
 
 def calculate_segmentation_loss(pred_masks, target_masks):
@@ -122,6 +123,9 @@ def calculate_total_loss(outputs, args):
 
 def train_epoch(model, train_dataloader, optimizer, epoch, device, args, accelerator):
     """Train for one epoch"""
+    # Enable anomaly detection for detailed error tracing
+    torch.autograd.set_detect_anomaly(True)
+    
     logger = logging.getLogger('training')
     model.train()
     total_loss = 0
@@ -137,13 +141,12 @@ def train_epoch(model, train_dataloader, optimizer, epoch, device, args, acceler
     
     try:
         for batch_idx, batch in enumerate(train_dataloader):
-            
             optimizer.zero_grad()
             
             # Forward pass
             with autocast():
                 outputs = model(batch['image'], batch['question'])
-                loss = args.loss_recon * outputs['loss_recon'] + args.loss_perc * outputs['loss_perc']
+                loss = args.loss_recon * outputs['loss_recon'] + args.loss_perc * outputs['loss_perc'] + args.loss_vgg * outputs['loss_vgg']
             
             # Clear memory before backward pass
             if torch.cuda.is_available():
@@ -184,10 +187,14 @@ def train_epoch(model, train_dataloader, optimizer, epoch, device, args, acceler
             accelerator.wait_for_everyone()
             
             if accelerator.is_main_process and batch_idx % args.log_interval == 0:
-                logger.debug(f'Detailed batch stats - Loss components: recon={outputs["loss_recon"]:.4f}, '
-                           f'perc={outputs["loss_perc"]:.4f}')
-                logger.debug(f'Batch {batch_idx} completed', f'recon loss {outputs["loss_recon"]:.4f}, perc loss {outputs["loss_perc"]:.4f}, total loss {loss.item():.4f}')
-            
+                logger.debug(
+                    "Batch %d stats - Loss components: recon=%.4f, perc=%.4f, vgg=%.4f, total=%.4f",
+                    batch_idx,
+                    outputs["loss_recon"],
+                    outputs["loss_perc"],
+                    outputs["loss_vgg"],
+                    loss.item()
+                )            
     except Exception as e:
         print(f"Error in train_epoch: {str(e)}")
         if torch.distributed.is_initialized():
@@ -217,11 +224,11 @@ def validate(model, val_loader, epoch, device, args, accelerator):
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
-            
+
             # Forward pass
             with autocast():
                 outputs = model(batch['image'], batch['question'])
-                loss = args.loss_recon * outputs['loss_recon'] + args.loss_perc * outputs['loss_perc']
+                loss = args.loss_recon * outputs['loss_recon'] + args.loss_perc * outputs['loss_perc'] + args.loss_vgg * outputs['loss_vgg']
             
             total_loss += loss.item()
             
@@ -368,7 +375,20 @@ def main(args):
         lr=args.learning_rate,
         weight_decay=args.weight_decay
     )
+
+    # Create cosine annealing scheduler with warmup
+    warmup_epochs = 5
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            # Linear warmup
+            return epoch / warmup_epochs
+        else:
+            # Cosine decay
+            progress = (epoch - warmup_epochs) / (args.num_epochs - warmup_epochs)
+            return 0.01 + (1 - 0.01) * 0.5 * (1 + math.cos(math.pi * progress))
     
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     # Load checkpoint if it exists
     start_epoch = args.start_epoch
     best_loss = float('inf')
@@ -382,9 +402,9 @@ def main(args):
 
     
     # Prepare dataloaders
-    train_dataloader, val_dataloader, train_sampler, val_sampler = create_vqa_dataloaders(args)
+    train_dataloader, val_dataloader = create_vqa_dataloaders(args)
     
-    # Prepare model, optimizer, dataloaders with accelerator
+    # Let accelerator handle distribution
     model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader, val_dataloader
     )
@@ -392,7 +412,7 @@ def main(args):
     try:
         # Training loop
         for epoch in range(start_epoch, args.num_epochs):
-            train_sampler.set_epoch(epoch)
+
             
             with autocast():
                 model.train()
@@ -401,9 +421,10 @@ def main(args):
             # Run validation on all processes
             model.eval()
             val_loss = validate(model, val_dataloader, epoch, device, args, accelerator)
-            
+            scheduler.step()
+            # Log learning rate
             if accelerator.is_main_process:
-                # Log to wandb
+                current_lr = optimizer.param_groups[0]['lr']
                 wandb.log({
                     'epoch': epoch,
                     'learning_rate': optimizer.param_groups[0]['lr'],

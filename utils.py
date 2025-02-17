@@ -20,7 +20,7 @@ def setup_logger(args):
     # Create logger
     logger = logging.getLogger('training')
     logger.handlers.clear()
-    logger.setLevel(logging.INFO)
+    logger.setLevel(os.environ.get('LOGLEVEL', 'INFO'))
     
     # Create formatters
     detailed_formatter = logging.Formatter(
@@ -119,19 +119,26 @@ def load_checkpoint(model, optimizer, checkpoint_path, device):
         else:
             raise KeyError("No model state dict found in checkpoint")
         
+        # Load only matching parameters
+        matched_state_dict = {}
         for key, v in checkpoint[state_dict_key].items():
             if key in current_state:
-                current_state[key] = v
+                if current_state[key].shape == v.shape:
+                    matched_state_dict[key] = v
+                else:
+                    logger.warning(f"Skipping parameter {key} due to shape mismatch: "
+                                 f"checkpoint={v.shape}, model={current_state[key].shape}")
             else:
-                logger.warning(f"Warning: Checkpoint parameter {key} not found in current model")
+                logger.warning(f"Parameter {key} not found in current model")
         
-        model.load_state_dict(current_state)
+        model.load_state_dict(matched_state_dict, strict=False)
         
-        if optimizer is not None and 'optimizer_state_dict' in checkpoint:
-            logger.info("Loading optimizer state...")
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # Skip loading optimizer state when architecture changes
+        logger.info("Skipping optimizer state due to architecture change")
             
-        logger.info(f"Loaded {len(checkpoint[state_dict_key])} trainable parameters")
+        logger.info(f"Loaded {len(matched_state_dict)} matching parameters")
+        
+        return start_epoch, best_loss
         
     except Exception as e:
         logger.error(f"Error loading checkpoint: {str(e)}")
@@ -157,13 +164,17 @@ def cleanup_distributed():
 
 def visualize_batch(image, generated_images, question, gt_answer, epoch, batch_idx, args, mode='train'):
     """Visualize a batch of images and save to wandb."""
+    logger = logging.getLogger('training')
+    
     # Create figure with subplots
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
     
     # Original image
     if isinstance(image, torch.Tensor):
         image = image.cpu().numpy()
-    if image.shape[0] == 3:  # If channels first, transpose
+        logger.debug(f"Original image tensor stats - min: {image.min():.3f}, max: {image.max():.3f}, mean: {image.mean():.3f}")
+
+    if image.shape[0] == 3:  # If channels first
         image = np.transpose(image, (1, 2, 0))
     ax1.imshow(image)
     ax1.set_title('Original Image')
@@ -172,13 +183,37 @@ def visualize_batch(image, generated_images, question, gt_answer, epoch, batch_i
     # Generated image
     if isinstance(generated_images, torch.Tensor):
         generated_image = generated_images[0].cpu().numpy()
+        logger.debug(f"Generated image tensor stats - min: {generated_image.min():.3f}, max: {generated_image.max():.3f}, mean: {generated_image.mean():.3f}")
     else:
         generated_image = generated_images[0]
+        
     if generated_image.shape[0] == 3:
         generated_image = np.transpose(generated_image, (1, 2, 0))
+        # Clamp values to [0,1] range for display
+        generated_image = np.clip(generated_image, 0.0, 1.0)
+        logger.debug(f"Generated image after transpose and clamp - shape: {generated_image.shape}, min: {generated_image.min():.3f}, max: {generated_image.max():.3f}")
+
     ax2.imshow(generated_image)
     ax2.set_title('Generated Image')
     ax2.axis('off')
+    
+    # Log color channel statistics
+    logger.debug(f"Original image channel stats:")
+    for i, channel in enumerate(['R', 'G', 'B']):
+        channel_data = image[..., i]
+        logger.debug(f"{channel} - min: {channel_data.min():.3f}, max: {channel_data.max():.3f}, "
+                    f"mean: {channel_data.mean():.3f}, std: {channel_data.std():.3f}")
+    
+    logger.debug(f"Generated image channel stats:")
+    for i, channel in enumerate(['R', 'G', 'B']):
+        channel_data = generated_image[..., i]
+        logger.debug(f"{channel} - min: {channel_data.min():.3f}, max: {channel_data.max():.3f}, "
+                    f"mean: {channel_data.mean():.3f}, std: {channel_data.std():.3f}")
+    
+    # Also log overall image statistics
+    logger.debug(f"Overall image stats:")
+    logger.debug(f"Original - mean: {image.mean():.3f}, std: {image.std():.3f}")
+    logger.debug(f"Generated - mean: {generated_image.mean():.3f}, std: {generated_image.std():.3f}")
     
     # Add question and ground truth answer as text
     plt.figtext(0.02, 0.02, f'Q: {question}\nGT: {gt_answer}', 

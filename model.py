@@ -37,6 +37,8 @@ from torchvision import transforms
 import bitsandbytes as bnb
 import torch.nn.functional as F
 from transformers import GenerationConfig
+import torchvision
+from torchvision import models
 
 
 logger = logging.get_logger(__name__)
@@ -1220,110 +1222,109 @@ class CLIPSegDecoderLayer(nn.Module):
 
         return outputs
 
+class GatedFusion(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, global_emb, local_emb):
+        # Ensure both embeddings have same shape: [batch_size, seq_len, dim]
+        if global_emb.dim() != local_emb.dim():
+            raise ValueError(f"Dimension mismatch: global_emb: {global_emb.shape}, local_emb: {local_emb.shape}")
+        
+        # Compute dynamic gate
+        gate = self.gate(torch.cat([global_emb, local_emb], dim=-1))
+        return gate * global_emb + (1 - gate) * local_emb
+
+class NStepUpsample(nn.Module):
+    def __init__(self, channels, n_steps):
+        """
+        Initializes an upsampling module that performs n_steps consecutive learnable upsampling operations.
+        
+        Args:
+            channels (int): The number of channels in the input (and output) feature maps.
+            n_steps (int): Number of upsampling steps; each step doubles the spatial resolution.
+        """
+        super(NStepUpsample, self).__init__()
+        blocks = []
+        for i in range(n_steps):
+            blocks.append(
+                nn.ConvTranspose2d(
+                    channels, channels,
+                    kernel_size=4, stride=2, padding=1, bias=False
+                )
+            )
+            blocks.append(nn.InstanceNorm2d(channels))
+            blocks.append(nn.ReLU(inplace=True))
+        self.upsample = nn.Sequential(*blocks)
+    
+    def forward(self, x):
+        B, L, D = x.shape
+        
+        # Calculate spatial dimension (e.g., sqrt(484) = 22).
+        H = int(math.sqrt(L))    
+
+        # Reshape tokens to spatial map: [B, H, H, D] then permute to [B, D, H, H].
+        x = x.reshape(B, H, H, D).permute(0, 3, 1, 2)
+        return self.upsample(x)
+
 
 class CLIPSegDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.conditional_layer = config.conditional_layer
-        if config.use_complex_transposed_convolution:
-            # Calculate upscale factor from 22x22 to 352x352
-            input_size = 22  # From CLIP's 16x16 patches on 352x352 image
-            target_size = 352
-            upscale_factor = target_size // input_size  # 16
-            
-            self.transposed_convolution = nn.Sequential(
-                # Initial processing at 22x22
-                nn.Conv2d(config.reduce_dim, config.reduce_dim, kernel_size=3, padding='same'),
-                nn.BatchNorm2d(config.reduce_dim),
-                nn.ReLU(),
-                
-                # First upsampling: 22x22 -> 44x44
-                nn.ConvTranspose2d(
-                    config.reduce_dim,
-                    config.reduce_dim // 2,
-                    kernel_size=4,
-                    stride=2,
-                    padding=1,
-                    output_padding=0
-                ),
-                nn.BatchNorm2d(config.reduce_dim // 2),
-                nn.ReLU(),
-                
-                # Second upsampling: 44x44 -> 88x88
-                nn.ConvTranspose2d(
-                    config.reduce_dim // 2,
-                    config.reduce_dim // 4,
-                    kernel_size=4,
-                    stride=2,
-                    padding=1,
-                    output_padding=0
-                ),
-                nn.BatchNorm2d(config.reduce_dim // 4),
-                nn.ReLU(),
-                
-                # Third upsampling: 88x88 -> 176x176
-                nn.ConvTranspose2d(
-                    config.reduce_dim // 4,
-                    config.reduce_dim // 8,
-                    kernel_size=4,
-                    stride=2,
-                    padding=1,
-                    output_padding=0
-                ),
-                nn.BatchNorm2d(config.reduce_dim // 8),
-                nn.ReLU(),
-                
-                # Final upsampling: 176x176 -> 352x352
-                nn.ConvTranspose2d(
-                    config.reduce_dim // 8,
-                    3,
-                    kernel_size=4,
-                    stride=2,
-                    padding=1,
-                    output_padding=0
-                ),
-                # Edge smoothing
-                nn.ReflectionPad2d(1),
-                nn.Conv2d(3, 3, kernel_size=3, padding=0),
-                nn.ReLU(),
-                nn.ReflectionPad2d(1),
-                nn.Conv2d(3, 3, kernel_size=3, padding=0),
-                nn.Sigmoid()
-            )
-        else:
-            self.transposed_convolution = nn.ConvTranspose2d(
-                config.reduce_dim, 3, config.vision_config.patch_size, stride=config.vision_config.patch_size
-            )
-            
-        # Initialize weights properly based on module type
-        def init_weights(m):
-            if isinstance(m, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d)):
-                # Use smaller standard deviation for more centered outputs
-                nn.init.normal_(m.weight, mean=0.0, std=0.02)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.0)
-                
-                # Special handling for final conv layer before sigmoid
-                if isinstance(m, nn.Conv2d) and m.out_channels == 3:
-                    nn.init.normal_(m.weight, mean=0.0, std=0.01)
-                    if m.bias is not None:
-                        nn.init.constant_(m.bias, 0.0)
         
-        # Apply initialization
-        self.apply(init_weights)
-
+        # Enable gradient checkpointing to save memory
+        self.gradient_checkpointing = True
+        
         depth = len(config.extract_layers)
-        self.reduces = nn.ModuleList(
-            [nn.Linear(config.vision_config.hidden_size, config.reduce_dim) for _ in range(depth)]
-        )
+        
+        self.fusion_layers = nn.ModuleList([GatedFusion(config.reduce_dim) 
+                                   for _ in range(depth)])
 
+        self.upsample_blocks = nn.ModuleList([
+            nn.Sequential(
+            # Upsample: double the spatial resolution.
+            nn.ConvTranspose2d(
+                config.reduce_dim, config.reduce_dim,
+                kernel_size=4, stride=2, padding=1, bias=False
+            ),
+            nn.InstanceNorm2d(config.reduce_dim),
+            nn.LeakyReLU(0.2, inplace=False),
+            # Refinement convolution: keeps the channel dimension.
+            nn.Conv2d(config.reduce_dim, config.reduce_dim, kernel_size=3, padding=1),
+                nn.LeakyReLU(0.2, inplace=False)
+            )
+            for _ in range(depth)]
+        )
+        self.emb_upsample = nn.ModuleList([NStepUpsample(config.reduce_dim, n_steps=i+1) for i in range(depth-1)])
+        
+        # Final convolution block: gradually reduce channels to 3.
+        # Here we add two conv layers with non-linearities.
+        self.final_conv = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(config.reduce_dim, config.reduce_dim // 2, kernel_size=3, padding=0),
+            nn.LeakyReLU(0.2, inplace=False),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(config.reduce_dim // 2, config.reduce_dim // 4, kernel_size=3, padding=0),
+            nn.LeakyReLU(0.2, inplace=False),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(config.reduce_dim // 4, config.reduce_dim // 8, kernel_size=3, padding=0),
+            nn.LeakyReLU(0.2, inplace=False),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(config.reduce_dim // 8, 3, kernel_size=3, padding=0)
+        )
+        
         decoder_config = copy.deepcopy(config.vision_config)
         decoder_config.hidden_size = config.reduce_dim
         decoder_config.num_attention_heads = config.decoder_num_attention_heads
         decoder_config.intermediate_size = config.decoder_intermediate_size
         decoder_config.hidden_act = "relu"
-        self.layers = nn.ModuleList([CLIPSegDecoderLayer(decoder_config) for _ in range(len(config.extract_layers))])
+        self.decoder_layers = nn.ModuleList([CLIPSegDecoderLayer(decoder_config) for _ in range(len(config.extract_layers))])
 
     def forward(
         self,
@@ -1333,50 +1334,50 @@ class CLIPSegDecoder(nn.Module):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = True,
     ):
-        
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
         global_embeddings = hidden_states[::-1]
         local_embeddings = local_embeddings[::-1]
-        
 
         output = None
-        for i, (global_embedding, local_embedding, layer) in enumerate(zip(global_embeddings, local_embeddings, self.layers)):
-            
-            # Scale global features before combining
-            combined_embedding = local_embedding
-            
-            layer_outputs = layer(
-                    combined_embedding,
-                    attention_mask=None,
-                    causal_attention_mask=None,
-                    output_attentions=output_attentions
-                )
+        for i, (global_embedding, local_embedding, layer, upsample) in enumerate(zip(global_embeddings, local_embeddings, self.decoder_layers, self.upsample_blocks)):
+            # Combine global and local features using gated fusion
+            combined_embedding = self.fusion_layers[i](global_embedding, local_embedding)[:, 1:, :] #Remove CLS token
+
+            if i > 0: #no need to upsample the first layer
+                combined_embedding = self.emb_upsample[i-1](combined_embedding)
 
             if output is not None:
-                output = layer_outputs[0] + output
+                output = output + combined_embedding
+                output = output.reshape(B, -1,output.shape[1])
             else:
-                output = layer_outputs[0]
+                output = combined_embedding
 
-            if output_hidden_states:
-                all_hidden_states += (output,)
-
-            if output_attentions:
-                all_attentions += (layer_outputs[1],)
+            layer_outputs = layer(
+                output,
+                attention_mask=None,
+                causal_attention_mask=None,
+                output_attentions=output_attentions
+            )[0]
+            B, L, D = layer_outputs.shape
+        
+            # Calculate spatial dimension (e.g., sqrt(484) = 22).
+            H = int(math.sqrt(L))    
+        
+            # Reshape tokens to spatial map: [B, H, H, D] then permute to [B, D, H, H].
+            layer_outputs = layer_outputs.reshape(B, H, H, D).permute(0, 3, 1, 2)
+            # First, upsample the new feature map.
+            output = upsample(layer_outputs)
             
+            # Then add with the previous output (if exists) which should be at the same resolution.
         
-        output = output[:, 1:, :].permute(0, 2, 1)
-        size = int(math.sqrt(output.shape[2]))  # Should be 22
-        batch_size = output.shape[0]
-        output = output.view(batch_size, output.shape[1], size, size)
+        output = F.interpolate(output, scale_factor=2, mode='bilinear', align_corners=False)
+        # Final convolution
+        logits = self.final_conv(output)
+
         
-        # Add activation to help with feature distribution
-        output = F.gelu(output)
-        
-        # Let transposed convolution handle the upsampling
-        logits = self.transposed_convolution(output)
-        
+
         # Verify output size
         if logits.shape[-1] != 352:
             raise ValueError(f"Expected output size 352, but got {logits.shape[-1]}")
@@ -1558,9 +1559,11 @@ class TextOrientedImageGeneration(nn.Module):
                     "Make sure that the feature dimension of the conditional embeddings matches"
                     " `config.projection_dim`."
                 )
+        global_embeddings = []
         local_embeddings = []
         for i, (activation, reduce) in enumerate(zip(activations, self.reduces)):
             activation = reduce(activation)
+            global_embeddings.append(activation)
             local_embedding = self.film_mul[i](conditional_embeddings) * activation.permute(1, 0, 2) + self.film_add[i](conditional_embeddings)
             local_embeddings.append(local_embedding.permute(1, 0, 2))
 
@@ -1568,7 +1571,7 @@ class TextOrientedImageGeneration(nn.Module):
 
         # step 3: forward through decoder
         decoder_outputs = self.decoder(
-            activations,
+            global_embeddings,
             local_embeddings,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1680,8 +1683,14 @@ class AnswerGenerationModel(nn.Module):
         self.generation_config.eos_token_id = self.tokenizer.eos_token_id
         self.llava.generation_config = self.generation_config
         
-        # Perceptual Loss (e.g., MSE Loss)
-        self.perc_loss = nn.MSELoss()
+        # Define layers for perceptual loss
+        # Early layers (5): low-level features
+        # Middle layers (9): mid-level patterns
+        # Later layers (12): high-level semantics
+        self.selected_layers = [5, 9, 12]
+        
+        # Perceptual Loss
+        self.perc_loss = nn.L1Loss()
         
     def forward(self, images, generated_images, questions):
         """Forward pass for answer generation"""
@@ -1728,24 +1737,31 @@ class AnswerGenerationModel(nn.Module):
         ]).to(self.llava.device)
         
         # Process entire batch at once for feature extraction
-        with torch.no_grad():
-            image_output = self.llava(
-                padded_ids,
-                images=images,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                use_cache=True
-            ).hidden_states[-1]
-            
-            gen_output = self.llava(
-                padded_ids,
-                images=generated_images,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                use_cache=True
-            ).hidden_states[-1]
+        image_outputs = self.llava(
+            padded_ids,
+            images=images,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=True
+        ).hidden_states
         
-        loss_perc = self.perc_loss(gen_output, image_output)
+        gen_outputs = self.llava(
+            padded_ids,
+            images=generated_images,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=True
+        ).hidden_states
+        
+        # Extract features from selected layers
+        image_features = [image_outputs[i] for i in self.selected_layers]
+        gen_features = [gen_outputs[i] for i in self.selected_layers]
+        
+        # Compute perceptual loss at each layer and average
+        layer_losses = []
+        for img_feat, gen_feat in zip(image_features, gen_features):
+            layer_losses.append(self.perc_loss(gen_feat, img_feat))
+        loss_perc = torch.stack(layer_losses).mean()
         
         # During training, skip text generation completely
         responses = [""] * images.size(0)
@@ -1779,10 +1795,53 @@ class AnswerGenerationModel(nn.Module):
         
         return {
             'text': responses,
-            'gen_features': gen_output,
-            'target_features': image_output,
+            'gen_features': gen_features,
+            'target_features': image_features,
             'loss_perc': loss_perc,
         }
+
+
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self, layers=["relu1_2", "relu2_2", "relu3_3"], use_l1=True):
+        super(VGGPerceptualLoss, self).__init__()
+    
+        # Load VGG-16 and extract its feature layers
+        vgg = models.vgg16(pretrained=True).features
+        
+        # Convert all ReLUs to non-inplace version
+        for module in vgg.modules():
+            if isinstance(module, nn.ReLU):
+                module.inplace = False
+    
+        # Define layer indices for feature extraction
+        self.layer_map = {
+            "relu1_2": 3,   # relu1_2
+            "relu2_2": 8,   # relu2_2
+            "relu3_3": 15,  # relu3_3
+        }
+    
+        self.selected_layers = [self.layer_map[l] for l in layers]
+    
+        # Extract required layers in a single pass
+        self.vgg = nn.Sequential(*list(vgg.children())[: max(self.selected_layers) + 1])
+        self.vgg.eval()
+        for param in self.vgg.parameters():
+            param.requires_grad = False  # Freeze VGG parameters
+    
+        # Choose loss function (L1 is better)
+        self.loss_fn = F.l1_loss if use_l1 else F.mse_loss
+    
+    def forward(self, x, y):
+        loss = 0
+        
+        for i, layer in enumerate(self.vgg.children()):
+            if i in self.selected_layers:
+                # Process x and y separately
+                x_feat = layer(x)
+                y_feat = layer(y)
+                loss += self.loss_fn(x_feat, y_feat)
+                
+        return loss
 
 
 class VQAWithSegmentation(nn.Module):
@@ -1791,6 +1850,13 @@ class VQAWithSegmentation(nn.Module):
         
         self.device = device
         self.processor = AutoProcessor.from_pretrained("CIDAS/clipseg-rd64-refined", do_rescale=False)
+        
+        # Initialize VGG perceptual loss
+        self.vgg_loss = VGGPerceptualLoss(
+            layers=["relu1_2", "relu2_2", "relu3_3"],
+            use_l1=True
+        ).to(device)
+
         # Initialize models
         self.image_generation_model = TextOrientedImageGeneration(config=config, device=self.device)
         self.perceptual_model = AnswerGenerationModel(
@@ -1798,11 +1864,13 @@ class VQAWithSegmentation(nn.Module):
             load_in_8bit=False,
             device=self.device
         )
+
         # Reconstruction Loss (e.g., L1 Loss)
         self.recon_loss = nn.L1Loss()
         # Define a transform to match VGG's expected input for perceptual loss
-        self.perceptual_preprocess = transforms.Normalize(mean=[0.5, 0.5, 0.5],
-                                                         std=[0.5, 0.5, 0.5])
+        self.perceptual_preprocess = transforms.Compose([
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
         
         
         
@@ -1849,10 +1917,14 @@ class VQAWithSegmentation(nn.Module):
 
         perceptual_loss = self.perceptual_model(targets_normalized, generated_normalized, questions)['loss_perc']
         
+        # Add VGG perceptual loss
+        vgg_loss = self.vgg_loss(generated_images, images)
+        
         return {
             'generated_images': outputs.logits,
             'loss_recon': recon_loss,
-            'loss_perc': perceptual_loss
+            'loss_perc': perceptual_loss,
+            'loss_vgg': vgg_loss
         }
 
 
@@ -1868,40 +1940,63 @@ __all__ = [
 def tensor_to_pil(tensor, image_mean=(0.5, 0.5, 0.5), image_std=(0.5, 0.5, 0.5), rescale_factor=1/255, data_format="channels_first"):
     """
     Converts a PyTorch tensor back to a PIL Image by reversing preprocessing transformations.
-
-    Args:
-        tensor (torch.Tensor): The preprocessed image tensor.
-        image_mean (tuple): Mean values used for normalization.
-        image_std (tuple): Standard deviation values used for normalization.
-        rescale_factor (float): Factor used to rescale images during preprocessing.
-        data_format (str): The format of the channel dimension, either "channels_first" (CHW) or "channels_last" (HWC).
-
-    Returns:
-        PIL.Image: The restored PIL image.
+    For Tanh activation, input tensor range is [-1, 1]
     """
-
-    # Remove batch dimension if present (from shape [1, 3, H, W] to [3, H, W])
+    # Remove batch dimension if present
     if tensor.ndim == 4:  
         tensor = tensor.squeeze(0)
 
     # Ensure the tensor is in NumPy format
     array = tensor.detach().cpu().numpy()
 
-    # Reverse channel formatting: (C, H, W) -> (H, W, C) if needed
+    # Reverse channel formatting if needed
     if data_format == "channels_first":
-        array = np.transpose(array, (1, 2, 0))  # Convert from CHW to HWC
+        array = np.transpose(array, (1, 2, 0))
 
-    # Reverse normalization: (x * std) + mean
+    # For Tanh output: Convert from [-1, 1] to [0, 1] first
+    array = (array + 1) / 2
+    # Then apply normalization reversal
     array = (array * np.array(image_std)) + np.array(image_mean)
 
-    # Reverse rescaling: Multiply by 1/rescale_factor (i.e., 255 if rescale_factor = 1/255)
+    # Reverse rescaling
     array = array / rescale_factor
 
-    # Clip values to ensure they are within valid image range [0, 255]
+    # Clip values
     array = np.clip(array, 0, 255).astype(np.uint8)
 
-    # Convert to PIL Image
     return Image.fromarray(array)
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // 2),
+            nn.LeakyReLU(0.2, inplace=False),
+            nn.Linear(channels // 2, channels),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+class ColorEnhancementModule(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.enhance = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.LeakyReLU(0.2, inplace=False),
+            nn.Conv2d(channels, channels, kernel_size=1, groups=3),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        enhanced = self.enhance(x)
+        return x * enhanced  
 
 
 

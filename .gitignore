@@ -20,6 +20,8 @@ outputs/
 wandb/
 VQAv2/
 checkpoints/
+train.sh
+split_cache/
 *.pth
 *.ckpt
 *.pt

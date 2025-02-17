@@ -38,6 +38,8 @@ def parse_args():
                        help='Weight for reconstruction loss')
     parser.add_argument('--loss_perc', type=float, default=0.1, 
                        help='Weight for perceptual loss')
+    parser.add_argument('--loss_vgg', type=float, default=10.0, 
+                       help='Weight for VGG perceptual loss')
     
     # Logging arguments
     parser.add_argument('--log_interval', type=int, default=10)
@@ -45,5 +47,17 @@ def parse_args():
                        help='How many batches to wait before logging example predictions')
     parser.add_argument('--vis_interval', type=int, default=100, 
                        help='Interval for visualization')
+    
+    # Dataset splitting arguments (all optional)
+    parser.add_argument('--split_type', type=str,
+                       choices=['image_based', 'question_based'],
+                       help='First level split type (optional)', default=None)
+    parser.add_argument('--split_level2', type=str,
+                       choices=['scene', 'subject', 'reasoning', 'type'],
+                       help='Second level split category (optional)', default=None)
+    parser.add_argument('--train_category', type=str,
+                       help='Category to use for training (optional)', default=None)
+    parser.add_argument('--val_category', type=str,
+                       help='Category to use for validation (optional)', default=None)
     
     return parser.parse_args() 

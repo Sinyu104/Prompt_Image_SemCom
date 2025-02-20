@@ -1859,11 +1859,11 @@ class VQAWithSegmentation(nn.Module):
 
         # Initialize models
         self.image_generation_model = TextOrientedImageGeneration(config=config, device=self.device)
-        self.perceptual_model = AnswerGenerationModel(
-            model_path="qnguyen3/nanoLLaVA-1.5",
-            load_in_8bit=False,
-            device=self.device
-        )
+        # self.perceptual_model = AnswerGenerationModel(
+        #     model_path="qnguyen3/nanoLLaVA-1.5",
+        #     load_in_8bit=False,
+        #     device=self.device
+        # )
 
         # Reconstruction Loss (e.g., L1 Loss)
         self.recon_loss = nn.L1Loss()
@@ -1910,12 +1910,12 @@ class VQAWithSegmentation(nn.Module):
         # 2. Perceptual Loss
         # --------------------
         # Add batch dimension for interpolation
-        generated_normalized = F.interpolate(self.perceptual_preprocess(generated_images), 
-                                          size=(384, 384), mode='bilinear', align_corners=False)
-        targets_normalized = F.interpolate(self.perceptual_preprocess(images),
-                                         size=(384, 384), mode='bilinear', align_corners=False)
+        # generated_normalized = F.interpolate(self.perceptual_preprocess(generated_images), 
+        #                                   size=(384, 384), mode='bilinear', align_corners=False)
+        # targets_normalized = F.interpolate(self.perceptual_preprocess(images),
+        #                                  size=(384, 384), mode='bilinear', align_corners=False)
 
-        perceptual_loss = self.perceptual_model(targets_normalized, generated_normalized, questions)['loss_perc']
+        # perceptual_loss = self.perceptual_model(targets_normalized, generated_normalized, questions)['loss_perc']
         
         # Add VGG perceptual loss
         vgg_loss = self.vgg_loss(generated_images, images)
@@ -1923,7 +1923,7 @@ class VQAWithSegmentation(nn.Module):
         return {
             'generated_images': outputs.logits,
             'loss_recon': recon_loss,
-            'loss_perc': perceptual_loss,
+            'loss_perc': 0,
             'loss_vgg': vgg_loss
         }
 

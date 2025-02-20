@@ -464,8 +464,10 @@ def create_vqa_dataloaders(args):
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
+        shuffle=True,
+        num_workers=args.num_workers,  # More workers per GPU
+        pin_memory=True,
+        persistent_workers=True,
         collate_fn=collate_fn
     )
     
@@ -473,7 +475,9 @@ def create_vqa_dataloaders(args):
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=args.num_workers,  # Also increase val workers
+        pin_memory=True,
+        persistent_workers=True,
         collate_fn=collate_fn
     )
     

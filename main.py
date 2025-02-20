@@ -129,6 +129,7 @@ def train_epoch(model, train_dataloader, optimizer, epoch, device, args, acceler
     logger = logging.getLogger('training')
     model.train()
     total_loss = 0
+
     # Create progress bar
     if accelerator.is_main_process:
         progress_bar = tqdm(
@@ -138,21 +139,20 @@ def train_epoch(model, train_dataloader, optimizer, epoch, device, args, acceler
             leave=True,
             file=sys.stdout
         )
-    
+   
     try:
         for batch_idx, batch in enumerate(train_dataloader):
+
+            
             optimizer.zero_grad()
             
             # Forward pass
             with autocast():
                 outputs = model(batch['image'], batch['question'])
                 loss = args.loss_recon * outputs['loss_recon'] + args.loss_perc * outputs['loss_perc'] + args.loss_vgg * outputs['loss_vgg']
+
             
-            # Clear memory before backward pass
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            # Use accelerator for backward pass and optimization
+            # Backward pass and optimization
             accelerator.backward(loss)
             
             if accelerator.sync_gradients:
@@ -208,7 +208,6 @@ def validate(model, val_loader, epoch, device, args, accelerator):
     logger = logging.getLogger('training')
     total_loss = 0
     num_batches = len(val_loader)
-
     # Set models to correct modes
     model.eval()
     
@@ -283,7 +282,6 @@ def main(args):
     valid_interface = None
     if int(os.environ.get("LOCAL_RANK", -1)) == 0:
         valid_interface = print_network_info()
-        print_memory_stats()
     
     # Share the interface name across processes
     if torch.distributed.is_initialized():
@@ -332,9 +330,9 @@ def main(args):
     fsdp_plugin = FullyShardedDataParallelPlugin(
         state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
         optim_state_dict_config=FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        sharding_strategy="NO_SHARD",  # Try without sharding first
+        sharding_strategy="NO_SHARD",    # Disable sharding for now
         cpu_offload=False,
-        use_orig_params=True,
+        use_orig_params=True,            # Use original parameters
     )
 
     # Initialize accelerator with FSDP
@@ -380,8 +378,8 @@ def main(args):
     warmup_epochs = 5
     def lr_lambda(epoch):
         if epoch < warmup_epochs:
-            # Linear warmup
-            return epoch / warmup_epochs
+            # Keep initial learning rate during warmup
+            return 1.0
         else:
             # Cosine decay
             progress = (epoch - warmup_epochs) / (args.num_epochs - warmup_epochs)
@@ -409,16 +407,18 @@ def main(args):
         model, optimizer, train_dataloader, val_dataloader
     )
     
+    
     try:
         # Training loop
         for epoch in range(start_epoch, args.num_epochs):
-
-            
+        
             with autocast():
                 model.train()
                 train_loss = train_epoch(model, train_dataloader, optimizer, epoch, device, args, accelerator)
             
-            # Run validation on all processes
+            
+            # Run validation every 5 epochs
+            
             model.eval()
             val_loss = validate(model, val_dataloader, epoch, device, args, accelerator)
             scheduler.step()
@@ -456,9 +456,6 @@ def main(args):
             accelerator.wait_for_everyone() 
             
             
-            if int(os.environ.get("LOCAL_RANK", -1)) == 0:
-                print_memory_stats()
-                
     except Exception as e:
         print(f"Training error: {str(e)}")
         if torch.distributed.is_initialized():

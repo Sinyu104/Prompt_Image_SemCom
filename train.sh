@@ -17,19 +17,23 @@ export NCCL_SOCKET_NTHREADS=4
 # Memory management
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_CACHE_DISABLE=1
+# Enable parallel CPU operations
+export OMP_NUM_THREADS=8  # Parallel operations
+export MKL_NUM_THREADS=8  # Intel MKL parallelism
+export NUMEXPR_NUM_THREADS=8  # NumExpr parallelism
 
 
 # Set initial batch size (will be divided by number of GPUs)
-TOTAL_BATCH_SIZE=4  # Further reduce batch size
+TOTAL_BATCH_SIZE=16  # Further reduce batch size
 NUM_GPUS=4
 PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
 # Directory paths
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
-OUTPUT_DIR="$HOME/prompt_image_segment/outputs/$(date +%Y%m%d_%H%M%S)"
-# OUTPUT_DIR="$HOME/prompt_image_segment/outputs/20250212_002407"
-# RESUME_DIR="$HOME/prompt_image_segment/outputs/20250212_002407/checkpoint_epoch_19_loss_8.8996.pth"
-RESUME_DIR=None
+# OUTPUT_DIR="$HOME/prompt_image_segment/outputs/$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="$HOME/prompt_image_segment/outputs/20250218_215427"
+RESUME_DIR="$HOME/prompt_image_segment/outputs/20250218_215427/checkpoint_epoch_81_loss_7.2894.pth"
+# RESUME_DIR=None
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -45,21 +49,21 @@ accelerate launch \
     --multi_gpu \
     --num_processes $NUM_GPUS \
     --mixed_precision fp16 \
-    --gradient_accumulation_steps 32 \
+    --gradient_accumulation_steps 4 \
     --num_machines 1 \
     main.py \
     --data_dir $DATA_DIR \
     --output_dir $OUTPUT_DIR \
     --batch_size $PER_GPU_BATCH_SIZE \
-    --num_epochs 10000 \
-    --start_epoch 0 \
+    --num_epochs 400 \
+    --start_epoch 1 \
     --learning_rate 1e-4 \
     --weight_decay 0.01 \
-    --num_workers 0 \
+    --num_workers 1 \
     --lambda_sparsity 0.0 \
     --lambda_smoothness 0.0 \
     --lambda_answer 0.0 \
-    --loss_recon 10.0 \
+    --loss_recon 1.0 \
     --loss_perc 0.0 \
     --loss_vgg 10.0 \
     --log_interval 400 \
@@ -76,21 +80,21 @@ echo "accelerate launch \
     --multi_gpu \
     --num_processes $NUM_GPUS \
     --mixed_precision fp16 \
-    --gradient_accumulation_steps 32 \
+    --gradient_accumulation_steps 16 \
     --num_machines 1 \
     main.py \
     --data_dir $DATA_DIR \
     --output_dir $OUTPUT_DIR \
     --batch_size $PER_GPU_BATCH_SIZE \
-    --num_epochs 10000 \
-    --start_epoch 0 \
+    --num_epochs 400 \
+    --start_epoch 1 \
     --learning_rate 1e-4 \
     --weight_decay 0.01 \
-    --num_workers 0 \
+    --num_workers 1 \
     --lambda_sparsity 0.0 \
     --lambda_smoothness 0.0 \
     --lambda_answer 0.0 \
-    --loss_recon 10.0 \
+    --loss_recon 1.0 \
     --loss_perc 0.0 \
     --loss_vgg 10.0 \
     --log_interval 400 \

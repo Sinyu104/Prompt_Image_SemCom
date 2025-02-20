@@ -22,6 +22,7 @@ VQAv2/
 checkpoints/
 train.sh
 split_cache/
+copy_to_cc.sh
 *.pth
 *.ckpt
 *.pt

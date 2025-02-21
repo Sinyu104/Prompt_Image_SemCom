@@ -1262,13 +1262,7 @@ class NStepUpsample(nn.Module):
         self.upsample = nn.Sequential(*blocks)
     
     def forward(self, x):
-        B, L, D = x.shape
         
-        # Calculate spatial dimension (e.g., sqrt(484) = 22).
-        H = int(math.sqrt(L))    
-
-        # Reshape tokens to spatial map: [B, H, H, D] then permute to [B, D, H, H].
-        x = x.reshape(B, H, H, D).permute(0, 3, 1, 2)
         return self.upsample(x)
 
 
@@ -1302,6 +1296,17 @@ class CLIPSegDecoder(nn.Module):
             for _ in range(depth)]
         )
         self.emb_upsample = nn.ModuleList([NStepUpsample(config.reduce_dim, n_steps=i+1) for i in range(depth-1)])
+        self.conv_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(config.reduce_dim*2, config.reduce_dim, kernel_size=3, padding=1),
+                nn.InstanceNorm2d(config.reduce_dim),  # Use ch after conv
+                nn.LeakyReLU(0.2, inplace=False),
+                nn.Conv2d(config.reduce_dim, config.reduce_dim, kernel_size=3, padding=1),
+                nn.InstanceNorm2d(config.reduce_dim),  # Use ch after conv
+                nn.LeakyReLU(0.2, inplace=False)
+            )
+            for _ in range(depth)]
+        )
         
         # Final convolution block: gradually reduce channels to 3.
         # Here we add two conv layers with non-linearities.
@@ -1341,38 +1346,27 @@ class CLIPSegDecoder(nn.Module):
         local_embeddings = local_embeddings[::-1]
 
         output = None
-        for i, (global_embedding, local_embedding, layer, upsample) in enumerate(zip(global_embeddings, local_embeddings, self.decoder_layers, self.upsample_blocks)):
+        for i, (global_embedding, local_embedding, upsample) in enumerate(zip(global_embeddings, local_embeddings, self.upsample_blocks)):
             # Combine global and local features using gated fusion
             combined_embedding = self.fusion_layers[i](global_embedding, local_embedding)[:, 1:, :] #Remove CLS token
-
+            B, L, D = combined_embedding.shape
+            H = int(math.sqrt(L))
+            combined_embedding = combined_embedding.reshape(B, H, H, D).permute(0, 3, 1, 2)
             if i > 0: #no need to upsample the first layer
                 combined_embedding = self.emb_upsample[i-1](combined_embedding)
 
             if output is not None:
-                output = output + combined_embedding
-                output = output.reshape(B, -1,output.shape[1])
+                output = torch.cat([output, combined_embedding], dim=1)
+                output = self.conv_blocks[i-1](output)
             else:
                 output = combined_embedding
-
-            layer_outputs = layer(
-                output,
-                attention_mask=None,
-                causal_attention_mask=None,
-                output_attentions=output_attentions
-            )[0]
-            B, L, D = layer_outputs.shape
         
-            # Calculate spatial dimension (e.g., sqrt(484) = 22).
-            H = int(math.sqrt(L))    
-        
-            # Reshape tokens to spatial map: [B, H, H, D] then permute to [B, D, H, H].
-            layer_outputs = layer_outputs.reshape(B, H, H, D).permute(0, 3, 1, 2)
-            # First, upsample the new feature map.
-            output = upsample(layer_outputs)
             
+            # First, upsample the new feature map.
+            output = upsample(output)
             # Then add with the previous output (if exists) which should be at the same resolution.
         
-        output = F.interpolate(output, scale_factor=2, mode='bilinear', align_corners=False)
+        
         # Final convolution
         logits = self.final_conv(output)
 

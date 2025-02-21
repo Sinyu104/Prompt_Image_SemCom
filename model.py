@@ -1329,7 +1329,7 @@ class CLIPSegDecoder(nn.Module):
         decoder_config.num_attention_heads = config.decoder_num_attention_heads
         decoder_config.intermediate_size = config.decoder_intermediate_size
         decoder_config.hidden_act = "relu"
-        self.decoder_layers = nn.ModuleList([CLIPSegDecoderLayer(decoder_config) for _ in range(len(config.extract_layers))])
+        # self.decoder_layers = nn.ModuleList([CLIPSegDecoderLayer(decoder_config) for _ in range(len(config.extract_layers))])
 
     def forward(
         self,

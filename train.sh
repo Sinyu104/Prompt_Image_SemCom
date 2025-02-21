@@ -24,7 +24,7 @@ export NUMEXPR_NUM_THREADS=8  # NumExpr parallelism
 
 
 # Set initial batch size (will be divided by number of GPUs)
-TOTAL_BATCH_SIZE=16  # Further reduce batch size
+TOTAL_BATCH_SIZE=128  # Further reduce batch size
 NUM_GPUS=4
 PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
@@ -49,7 +49,7 @@ accelerate launch \
     --multi_gpu \
     --num_processes $NUM_GPUS \
     --mixed_precision fp16 \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps 2 \
     --num_machines 1 \
     main.py \
     --data_dir $DATA_DIR \

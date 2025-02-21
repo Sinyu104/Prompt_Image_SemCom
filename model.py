@@ -1265,6 +1265,82 @@ class NStepUpsample(nn.Module):
         
         return self.upsample(x)
 
+class RefinementUNet(nn.Module):
+    def __init__(self, in_channels=3, base_channels=32):
+        """
+        A small U-Net that refines an image.
+        It downsamples twice and then upsamples back to the original resolution.
+        
+        Args:
+            in_channels (int): Number of input channels (typically 3 for RGB).
+            base_channels (int): Number of channels for the first conv layer.
+        """
+        super().__init__()
+        # Encoder
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.pool1 = nn.MaxPool2d(2)  # halves resolution
+        
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels*2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels*2, base_channels*2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.pool2 = nn.MaxPool2d(2)  # further halves resolution
+        
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(base_channels*2, base_channels*4, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels*4, base_channels*4, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Decoder
+        self.up2 = nn.ConvTranspose2d(base_channels*4, base_channels*2, kernel_size=4, stride=2, padding=1)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(base_channels*4, base_channels*2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels*2, base_channels*2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.up1 = nn.ConvTranspose2d(base_channels*2, base_channels, kernel_size=4, stride=2, padding=1)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(base_channels*2, base_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Final conv: Predict a residual image
+        self.final_conv = nn.Conv2d(base_channels, in_channels, kernel_size=1)
+        
+    def forward(self, x):
+        # x: [B, 3, H, W] (e.g., 352x352)
+        enc1 = self.enc1(x)         # [B, base_channels, H, W]
+        enc2 = self.enc2(self.pool1(enc1))  # [B, base_channels*2, H/2, W/2]
+        bottleneck = self.bottleneck(self.pool2(enc2))  # [B, base_channels*4, H/4, W/4]
+        
+        dec2 = self.up2(bottleneck)  # [B, base_channels*2, H/2, W/2]
+        # Concatenate with enc2 (skip connection)
+        dec2 = torch.cat([dec2, enc2], dim=1)  # [B, base_channels*4, H/2, W/2]
+        dec2 = self.dec2(dec2)        # [B, base_channels*2, H/2, W/2]
+        
+        dec1 = self.up1(dec2)         # [B, base_channels, H, W]
+        dec1 = torch.cat([dec1, enc1], dim=1)  # [B, base_channels*2, H, W]
+        dec1 = self.dec1(dec1)        # [B, base_channels, H, W]
+        
+        residual = self.final_conv(dec1)  # [B, 3, H, W]
+        # Refined output is the original image plus the learned residual
+        refined = x + residual
+        return refined
+
 
 class CLIPSegDecoder(nn.Module):
     def __init__(self, config):
@@ -1330,6 +1406,7 @@ class CLIPSegDecoder(nn.Module):
         decoder_config.intermediate_size = config.decoder_intermediate_size
         decoder_config.hidden_act = "relu"
         # self.decoder_layers = nn.ModuleList([CLIPSegDecoderLayer(decoder_config) for _ in range(len(config.extract_layers))])
+        self.refiner = RefinementUNet(in_channels=3, base_channels=32)
 
     def forward(
         self,
@@ -1370,7 +1447,7 @@ class CLIPSegDecoder(nn.Module):
         # Final convolution
         logits = self.final_conv(output)
 
-        
+        logits = self.refiner(logits)
 
         # Verify output size
         if logits.shape[-1] != 352:

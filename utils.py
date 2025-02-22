@@ -66,7 +66,7 @@ def print_memory_stats():
             logger.info(f"Memory Reserved: {torch.cuda.memory_reserved(i) / 1e9:.2f} GB")
     return ""
 
-def save_checkpoint(model, optimizer, epoch, loss, args):
+def save_checkpoint(model, epoch, loss, args):
     """Save model checkpoint."""
     logger = logging.getLogger('training')
     try:
@@ -79,15 +79,10 @@ def save_checkpoint(model, optimizer, epoch, loss, args):
         
         logger.info("Number of parameters being saved: %d", len(model_state_dict))
         
-        optimizer_state_dict = {
-            k: v for k, v in optimizer.state_dict().items()
-            if 'state' not in k or any(p.requires_grad for p in model.parameters())
-        }
         
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': model_state_dict,
-            'optimizer_state_dict': optimizer_state_dict,
             'loss': loss,
         }
         
@@ -95,8 +90,9 @@ def save_checkpoint(model, optimizer, epoch, loss, args):
             args.output_dir, 
             f'checkpoint_epoch_{epoch}_loss_{loss:.4f}.pth'
         )
-        
         torch.save(checkpoint, checkpoint_path)
+        logger.info(f"Successfully saved checkpoint to {checkpoint_path}")
+        
         
     except Exception as e:
         logger.error(f"Error saving checkpoint: {str(e)}")

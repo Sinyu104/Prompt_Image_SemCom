@@ -66,6 +66,8 @@ accelerate launch \
     --loss_recon 1.0 \
     --loss_perc 0.0 \
     --loss_vgg 10.0 \
+    --loss_gen 0.2 \
+    --loss_disc 0.5 \
     --log_interval 400 \
     --sample_interval 100 \
     --split_type image_based \
@@ -80,7 +82,7 @@ echo "accelerate launch \
     --multi_gpu \
     --num_processes $NUM_GPUS \
     --mixed_precision fp16 \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps 2 \
     --num_machines 1 \
     main.py \
     --data_dir $DATA_DIR \
@@ -97,6 +99,8 @@ echo "accelerate launch \
     --loss_recon 1.0 \
     --loss_perc 0.0 \
     --loss_vgg 10.0 \
+    --loss_gen 0.2 \
+    --loss_disc 0.5 \
     --log_interval 400 \
     --sample_interval 100 \
     --split_type image_based \

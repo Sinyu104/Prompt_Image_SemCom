@@ -8,7 +8,7 @@ def parse_args():
                        help="Path to config file (optional)")
     
     # Add training hyperparameters
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=16,
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=2,
                        help="Number of steps to accumulate gradients")
     parser.add_argument("--mixed_precision", type=str, default="fp16",
                        choices=["no", "fp16", "bf16"],
@@ -40,6 +40,8 @@ def parse_args():
                        help='Weight for perceptual loss')
     parser.add_argument('--loss_vgg', type=float, default=10.0, 
                        help='Weight for VGG perceptual loss')
+    parser.add_argument('--loss_gen', type=float, default=0.1, help='Weight for generator adversarial loss')
+    parser.add_argument('--loss_disc', type=float, default=1.0, help='Weight for discriminator loss')
     
     # Logging arguments
     parser.add_argument('--log_interval', type=int, default=10)

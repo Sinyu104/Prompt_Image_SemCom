@@ -2,7 +2,7 @@ import torch
 from PIL import Image
 import requests
 from transformers import AutoProcessor
-from model import VQAWithSegmentation
+from model import VQAWithSegmentation, PatchGANDiscriminator
 import matplotlib.pyplot as plt
 import numpy as np
 from torch.utils.data import DataLoader
@@ -121,14 +121,18 @@ def calculate_total_loss(outputs, args):
     
     return total_loss
 
-def train_epoch(model, train_dataloader, optimizer, epoch, device, args, accelerator):
-    """Train for one epoch"""
-    # Enable anomaly detection for detailed error tracing
+def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, device, args, accelerator):
+    """Train for one epoch with separate generator and discriminator steps"""
     torch.autograd.set_detect_anomaly(True)
     
     logger = logging.getLogger('training')
-    model.train()
+    generator.train()
     total_loss = 0
+    
+    optimizer_G, optimizer_D = optimizer  # Unpack optimizers
+
+    # Define adversarial loss
+    adv_loss = nn.BCEWithLogitsLoss()
 
     # Create progress bar
     if accelerator.is_main_process:
@@ -142,29 +146,50 @@ def train_epoch(model, train_dataloader, optimizer, epoch, device, args, acceler
    
     try:
         for batch_idx, batch in enumerate(train_dataloader):
-
             
-            optimizer.zero_grad()
+            # Train Discriminator
+            optimizer_D.zero_grad()
             
-            # Forward pass
             with autocast():
-                outputs = model(batch['image'], batch['question'])
-                loss = args.loss_recon * outputs['loss_recon'] + args.loss_perc * outputs['loss_perc'] + args.loss_vgg * outputs['loss_vgg']
+                outputs = generator(batch['image'], batch['question'])
+                generated_images = outputs['generated_images']
+                
+                # Discriminator predictions
+                real_pred = discriminator(batch['image'])
+                fake_pred = discriminator(generated_images.detach())
+                
+                # Calculate discriminator losses
+                d_loss_real = adv_loss(real_pred, torch.ones_like(real_pred))
+                d_loss_fake = adv_loss(fake_pred, torch.zeros_like(fake_pred))
+                d_loss = (d_loss_real + d_loss_fake)*0.5
+            
+            accelerator.backward(d_loss)
+            optimizer_D.step()
 
+            # Train Generator
+            optimizer_G.zero_grad()
             
-            # Backward pass and optimization
-            accelerator.backward(loss)
+            with autocast():
+                fake_pred = discriminator(generated_images)
+                g_loss_adv = adv_loss(fake_pred, torch.ones_like(fake_pred))
+                
+                g_loss = (
+                    args.loss_recon * outputs['loss_recon'] +  
+                    args.loss_vgg * outputs['loss_vgg'] +
+                    args.loss_gen * g_loss_adv
+                )
             
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            accelerator.backward(g_loss)
+            optimizer_G.step()
             
-            optimizer.step()
-            
-            total_loss += loss.item()
+            total_loss += g_loss.item()  # Track generator loss
             
             # Update progress bar on main process
             if accelerator.is_main_process:
-                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+                progress_bar.set_postfix({
+                    "G_loss": f"{g_loss.item():.4f}",
+                    "D_loss": f"{d_loss.item():.4f}"
+                })
                 progress_bar.update(1)
             
             # Log batch statistics only on main process
@@ -188,12 +213,13 @@ def train_epoch(model, train_dataloader, optimizer, epoch, device, args, acceler
             
             if accelerator.is_main_process and batch_idx % args.log_interval == 0:
                 logger.debug(
-                    "Batch %d stats - Loss components: recon=%.4f, perc=%.4f, vgg=%.4f, total=%.4f",
+                    "Batch %d stats - Loss components: recon=%.4f, perc=%.4f, vgg=%.4f, g_loss=%.4f, d_loss=%.4f",
                     batch_idx,
                     outputs["loss_recon"],
                     outputs["loss_perc"],
                     outputs["loss_vgg"],
-                    loss.item()
+                    g_loss_adv.item(),
+                    d_loss.item()
                 )            
     except Exception as e:
         print(f"Error in train_epoch: {str(e)}")
@@ -201,75 +227,29 @@ def train_epoch(model, train_dataloader, optimizer, epoch, device, args, acceler
             torch.distributed.destroy_process_group()
         raise e
     
+    # Set gradient clipping
+    torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
+    
     return total_loss / len(train_dataloader)
 
-def validate(model, val_loader, epoch, device, args, accelerator):
+def validate(generator, val_loader, epoch, device, args, accelerator):
     """Validate the model"""
-    logger = logging.getLogger('training')
     total_loss = 0
-    num_batches = len(val_loader)
-    # Set models to correct modes
-    model.eval()
-    
-    # Create progress bar for validation
-    if accelerator.is_main_process:
-        progress_bar = tqdm(
-            total=len(val_loader),
-            desc=f"Validating Epoch {epoch}",
-            position=0,
-            leave=True,
-            file=sys.stdout
-        )
-    
+    num_batches = 0
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
-
-            # Forward pass
             with autocast():
-                outputs = model(batch['image'], batch['question'])
-                loss = args.loss_recon * outputs['loss_recon'] + args.loss_perc * outputs['loss_perc'] + args.loss_vgg * outputs['loss_vgg']
-            
-            total_loss += loss.item()
-            
-            # Update progress bar on main process
-            if accelerator.is_main_process:
-                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
-                progress_bar.update(1)
-            
-            # Log batch statistics only on main process
-            if accelerator.is_main_process and batch_idx % args.log_interval == 0:
-                with torch.no_grad():
-                    visualize_batch(
-                        batch['image'][0],
-                        outputs['generated_images'],
-                        batch['question'][0],
-                        batch['answer_text'][0],
-                        epoch,
-                        batch_idx,
-                        args,
-                        mode='val'
-                    )
-                    torch.cuda.empty_cache()
-            # Clear cache after each batch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                outputs = generator(batch['image'], batch['question'])
+                loss = (
+                    args.loss_recon * outputs['loss_recon'] + 
+                    args.loss_perc * outputs['loss_perc'] + 
+                    args.loss_vgg * outputs['loss_vgg']
+                )
+                total_loss += loss.item()
+                num_batches += 1
     
-    # Gather losses from all processes
-    total_loss = torch.tensor(total_loss, device=device)
-    if torch.distributed.is_initialized():
-        torch.distributed.all_reduce(total_loss)
-    avg_loss = total_loss.item() / (num_batches * accelerator.num_processes)
-    
-    if accelerator.is_main_process:
-        logger.info(f'Validation Epoch: {epoch}\tAverage Loss: {avg_loss:.6f}')
-    
-    # Close progress bar
-    if accelerator.is_main_process:
-        progress_bar.close()
-    
+    avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
     return avg_loss
-
-
 
 def main(args):
     # Setup logger
@@ -346,7 +326,6 @@ def main(args):
     # Initialize wandb only on the main process
     if accelerator.is_main_process:
         run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        os.makedirs(args.output_dir, exist_ok=True)
         wandb.init(
             project="prompt_image_segment",
             dir=args.output_dir,
@@ -358,18 +337,29 @@ def main(args):
     # Make sure wandb is initialized before proceeding
     accelerator.wait_for_everyone()
     
-    # Initialize model with config
-    model = VQAWithSegmentation(
+    # Initialize models
+    generator = VQAWithSegmentation(
         config=config,
         device=device,
     )
+    discriminator = PatchGANDiscriminator(
+        in_channels=3, 
+        base_channels=64
+    ).to(device)
     
-    # Move model to device
-    model = model.to(device)
+    # Move models to device
+    generator = generator.to(device)
+    discriminator = discriminator.to(device)
     
-    # Prepare optimizer
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
+    # Create separate optimizers
+    optimizer_G = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, generator.parameters()),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay
+    )
+    
+    optimizer_D = torch.optim.AdamW(
+        discriminator.parameters(),
         lr=args.learning_rate,
         weight_decay=args.weight_decay
     )
@@ -385,14 +375,14 @@ def main(args):
             progress = (epoch - warmup_epochs) / (args.num_epochs - warmup_epochs)
             return 0.01 + (1 - 0.01) * 0.5 * (1 + math.cos(math.pi * progress))
     
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler_G = torch.optim.lr_scheduler.LambdaLR(optimizer_G, lr_lambda)
+    scheduler_D = torch.optim.lr_scheduler.LambdaLR(optimizer_D, lr_lambda)
 
     # Load checkpoint if it exists
     start_epoch = args.start_epoch
     best_loss = float('inf')
     if args.resume_from_checkpoint and os.path.exists(args.resume_from_checkpoint):
-        
-        load_checkpoint(model, optimizer, args.resume_from_checkpoint, device)
+        load_checkpoint(generator, optimizer_G, args.resume_from_checkpoint, device)
         
         # Override loaded start_epoch if specified in args
         if args.start_epoch > 0:
@@ -403,8 +393,8 @@ def main(args):
     train_dataloader, val_dataloader = create_vqa_dataloaders(args)
     
     # Let accelerator handle distribution
-    model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader, val_dataloader
+    generator, discriminator, optimizer_G, optimizer_D, train_dataloader, val_dataloader = accelerator.prepare(
+        generator, discriminator, optimizer_G, optimizer_D, train_dataloader, val_dataloader
     )
     
     
@@ -413,33 +403,39 @@ def main(args):
         for epoch in range(start_epoch, args.num_epochs):
         
             with autocast():
-                model.train()
-                train_loss = train_epoch(model, train_dataloader, optimizer, epoch, device, args, accelerator)
+                generator.train()
+                train_loss = train_epoch(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
             
             
             # Run validation every 5 epochs
             
-            model.eval()
-            val_loss = validate(model, val_dataloader, epoch, device, args, accelerator)
-            scheduler.step()
+            generator.eval()
+            val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator)
+            logger.info(f"Epoch {epoch} - Train loss: {train_loss:.4f}, Val loss: {val_loss:.4f}")
+            
+            scheduler_G.step()
+            scheduler_D.step()
+            
             # Log learning rate
             if accelerator.is_main_process:
-                current_lr = optimizer.param_groups[0]['lr']
+                current_lr_G = optimizer_G.param_groups[0]['lr']
+                current_lr_D = optimizer_D.param_groups[0]['lr']
                 wandb.log({
                     'epoch': epoch,
-                    'learning_rate': optimizer.param_groups[0]['lr'],
+                    'learning_rate_G': current_lr_G,
+                    'learning_rate_D': current_lr_D,
                     'epoch_train_loss': train_loss,
                     'epoch_val_loss': val_loss,
                 })
                 
                 # Save checkpoint asynchronously
+                logger.info(f"Saving checkpoint with val_loss: {val_loss}")
                 save_thread = threading.Thread(
                     target=save_checkpoint,
                     args=(
-                        model.module if hasattr(model, "module") else model,
-                        optimizer,
+                        generator.module if hasattr(generator, "module") else generator,
                         epoch,
-                        val_loss,
+                        val_loss,  # Make sure this is not None
                         args
                     )
                 )

@@ -1850,7 +1850,7 @@ class VQAWithSegmentation(nn.Module):
             layers=["relu1_2", "relu2_2", "relu3_3"],
             use_l1=True
         ).to(device)
-
+        
         # Initialize models
         self.image_generation_model = TextOrientedImageGeneration(config=config, device=self.device)
         # self.perceptual_model = AnswerGenerationModel(
@@ -1865,7 +1865,6 @@ class VQAWithSegmentation(nn.Module):
         self.perceptual_preprocess = transforms.Compose([
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
-        
         
         
     def forward(self, images, questions):
@@ -1918,9 +1917,8 @@ class VQAWithSegmentation(nn.Module):
             'generated_images': outputs.logits,
             'loss_recon': recon_loss,
             'loss_perc': 0,
-            'loss_vgg': vgg_loss
+            'loss_vgg': vgg_loss,
         }
-
 
 __all__ = [
     "CLIPSegModel",
@@ -1991,6 +1989,61 @@ class ColorEnhancementModule(nn.Module):
     def forward(self, x):
         enhanced = self.enhance(x)
         return x * enhanced  
+
+class PatchGANDiscriminator(nn.Module):
+    def __init__(self, in_channels=3, base_channels=64):
+        """
+        A PatchGAN discriminator that classifies patches in the input image.
+        
+        Args:
+            in_channels (int): Number of channels in the input image (typically 3 for RGB).
+            base_channels (int): Base number of channels for the discriminator.
+        """
+        super().__init__()
+        self.model = nn.Sequential(
+            # First layer: no normalization, stride=2 reduces resolution.
+            nn.Conv2d(in_channels, base_channels, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Second layer: increase channels, stride=2.
+            nn.Conv2d(base_channels, base_channels * 2, kernel_size=4, stride=2, padding=1),
+            nn.InstanceNorm2d(base_channels * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Third layer: increase channels, stride=2.
+            nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=4, stride=2, padding=1),
+            nn.InstanceNorm2d(base_channels * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Fourth layer: use stride=1 to capture local details.
+            nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size=4, stride=1, padding=1),
+            nn.InstanceNorm2d(base_channels * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Final output layer: output a 1-channel prediction map.
+            nn.Conv2d(base_channels * 8, 1, kernel_size=4, stride=1, padding=1)
+        )
+        
+    def forward(self, x):
+        # Add input validation
+        if x.dim() != 4:
+            raise ValueError(f"Expected 4D input tensor (B,C,H,W), got shape {x.shape}")
+        if x.shape[1] != 3:
+            raise ValueError(f"Expected 3 channels, got {x.shape[1]}")
+        
+        # Ensure float type
+        x = x.float()
+        
+        return self.model(x)
+    
+    def get_intermediate_features(self, x):
+        """Get intermediate feature maps for feature matching loss"""
+        features = []
+        for layer in self.model:
+            x = layer(x)
+            if isinstance(layer, nn.LeakyReLU):
+                features.append(x)
+        return features
 
 
 

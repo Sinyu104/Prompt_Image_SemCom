@@ -153,6 +153,7 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
             with autocast():
                 outputs = generator(batch['image'], batch['question'])
                 generated_images = outputs['generated_images']
+                generated_images = torch.clamp(generated_images, 0, 1)
                 
                 # Discriminator predictions
                 real_pred = discriminator(batch['image'])

@@ -127,7 +127,8 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
     
     logger = logging.getLogger('training')
     generator.train()
-    total_loss = 0
+    total_g_loss = 0
+    total_d_loss = 0
     
     optimizer_G, optimizer_D = optimizer  # Unpack optimizers
 
@@ -183,7 +184,8 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
             accelerator.backward(g_loss)
             optimizer_G.step()
             
-            total_loss += g_loss.item()  # Track generator loss
+            total_g_loss += g_loss.item()  # Track generator loss
+            total_d_loss += d_loss.item()  # Track discriminator loss
             
             # Update progress bar on main process
             if accelerator.is_main_process:
@@ -231,7 +233,7 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
     # Set gradient clipping
     torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
     
-    return total_loss / len(train_dataloader)
+    return total_g_loss / len(train_dataloader), total_d_loss / len(train_dataloader)
 
 def validate(generator, val_loader, epoch, device, args, accelerator):
     """Validate the model"""
@@ -405,14 +407,14 @@ def main(args):
         
             with autocast():
                 generator.train()
-                train_loss = train_epoch(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
+                train_g_loss, train_d_loss = train_epoch(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
             
             
             # Run validation every 5 epochs
             
             generator.eval()
             val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator)
-            logger.info(f"Epoch {epoch} - Train loss: {train_loss:.4f}, Val loss: {val_loss:.4f}")
+            logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Train D loss: {train_d_loss:.4f}, Val loss: {val_loss:.4f}")
             
             scheduler_G.step()
             scheduler_D.step()
@@ -425,7 +427,8 @@ def main(args):
                     'epoch': epoch,
                     'learning_rate_G': current_lr_G,
                     'learning_rate_D': current_lr_D,
-                    'epoch_train_loss': train_loss,
+                    'epoch_train_g_loss': train_g_loss,
+                    'epoch_train_d_loss': train_d_loss,
                     'epoch_val_loss': val_loss,
                 })
                 

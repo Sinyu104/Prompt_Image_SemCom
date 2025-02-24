@@ -65,8 +65,8 @@ accelerate launch \
     --lambda_answer 0.0 \
     --loss_recon 1.0 \
     --loss_perc 0.0 \
-    --loss_vgg 10.0 \
-    --loss_gen 0.2 \
+    --loss_vgg 0.0 \
+    --loss_gen 0.005 \
     --loss_disc 0.5 \
     --log_interval 400 \
     --sample_interval 100 \

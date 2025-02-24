@@ -147,31 +147,12 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
    
     try:
         for batch_idx, batch in enumerate(train_dataloader):
-            
-            # Train Discriminator
-            optimizer_D.zero_grad()
-            
+            # Train Discriminator only on even batch indices
+            optimizer_G.zero_grad()
             with autocast():
                 outputs = generator(batch['image'], batch['question'])
                 generated_images = outputs['generated_images']
                 generated_images = torch.clamp(generated_images, 0, 1)
-                
-                # Discriminator predictions
-                real_pred = discriminator(batch['image'])
-                fake_pred = discriminator(generated_images.detach())
-                
-                # Calculate discriminator losses
-                d_loss_real = adv_loss(real_pred, torch.ones_like(real_pred))
-                d_loss_fake = adv_loss(fake_pred, torch.zeros_like(fake_pred))
-                d_loss = (d_loss_real + d_loss_fake)*0.5
-            
-            accelerator.backward(d_loss)
-            optimizer_D.step()
-
-            # Train Generator
-            optimizer_G.zero_grad()
-            
-            with autocast():
                 fake_pred = discriminator(generated_images)
                 g_loss_adv = adv_loss(fake_pred, torch.ones_like(fake_pred))
                 
@@ -183,9 +164,25 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
             
             accelerator.backward(g_loss)
             optimizer_G.step()
-            
+
+            if batch_idx % 2 == 0 and batch_idx > 10:
+                optimizer_D.zero_grad()
+                
+                with autocast():
+                    # Discriminator predictions
+                    real_pred = discriminator(batch['image'])
+                    fake_pred = discriminator(generated_images.detach())
+                    
+                    # Calculate discriminator losses
+                    d_loss_real = adv_loss(real_pred, torch.ones_like(real_pred))
+                    d_loss_fake = adv_loss(fake_pred, torch.zeros_like(fake_pred))
+                    d_loss = (d_loss_real + d_loss_fake) * 0.5
+                
+                accelerator.backward(d_loss)
+                optimizer_D.step()
+
             total_g_loss += g_loss.item()  # Track generator loss
-            total_d_loss += d_loss.item()  # Track discriminator loss
+            total_d_loss += d_loss.item() if batch_idx % 2 == 0 and batch_idx > 10 else 0  # Track discriminator loss
             
             # Update progress bar on main process
             if accelerator.is_main_process:
@@ -233,7 +230,7 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
     # Set gradient clipping
     torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
     
-    return total_g_loss / len(train_dataloader), total_d_loss / len(train_dataloader)
+    return total_g_loss / len(train_dataloader), total_d_loss / (len(train_dataloader) // 2)
 
 def validate(generator, val_loader, epoch, device, args, accelerator):
     """Validate the model"""

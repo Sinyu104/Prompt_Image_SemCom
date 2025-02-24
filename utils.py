@@ -67,7 +67,7 @@ def print_memory_stats():
     return ""
 
 def save_checkpoint(model, epoch, loss, args):
-    """Save model checkpoint."""
+    """Save model checkpoint and keep only the latest two."""
     logger = logging.getLogger('training')
     try:
         logger.info("Saving checkpoint...")
@@ -79,20 +79,30 @@ def save_checkpoint(model, epoch, loss, args):
         
         logger.info("Number of parameters being saved: %d", len(model_state_dict))
         
-        
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': model_state_dict,
             'loss': loss,
         }
-        
+
+        save_dir = os.path.join(args.output_dir, 'checkpoints')
+        os.makedirs(save_dir, exist_ok=True)
+
         checkpoint_path = os.path.join(
-            args.output_dir, 
+            save_dir,
             f'checkpoint_epoch_{epoch}_loss_{loss:.4f}.pth'
         )
+        
         torch.save(checkpoint, checkpoint_path)
         logger.info(f"Successfully saved checkpoint to {checkpoint_path}")
         
+        # Keep only the latest two checkpoints
+        checkpoints = [f for f in os.listdir(save_dir) if f.startswith('checkpoint')]
+        for ckpt in checkpoints:
+            ckpt_epoch = int(ckpt.split('_')[2])
+            if ckpt_epoch <= epoch - 2:
+                os.remove(os.path.join(save_dir, ckpt))
+                logger.info(f"Removed old checkpoint {ckpt}")
         
     except Exception as e:
         logger.error(f"Error saving checkpoint: {str(e)}")
@@ -230,4 +240,4 @@ def visualize_batch(image, generated_images, question, gt_answer, epoch, batch_i
         'ground_truth_answer': gt_answer
     })
     
-    plt.close() 
+    plt.close()

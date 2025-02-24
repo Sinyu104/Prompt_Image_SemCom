@@ -129,6 +129,7 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
     generator.train()
     total_g_loss = 0
     total_d_loss = 0
+    total_a_loss = 0
     
     optimizer_G, optimizer_D = optimizer  # Unpack optimizers
 
@@ -165,7 +166,7 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
             accelerator.backward(g_loss)
             optimizer_G.step()
 
-            if batch_idx % 2 == 0 and batch_idx > 10:
+            if batch_idx % args.discriminator_update_freq == 0:
                 optimizer_D.zero_grad()
                 
                 with autocast():
@@ -182,13 +183,15 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
                 optimizer_D.step()
 
             total_g_loss += g_loss.item()  # Track generator loss
-            total_d_loss += d_loss.item() if batch_idx % 2 == 0 and batch_idx > 10 else 0  # Track discriminator loss
+            total_a_loss += g_loss_adv.item()  # Track VGG loss
+            dis_loss = d_loss.item() if batch_idx % args.discriminator_update_freq == 0 else 0.0
+            total_d_loss += dis_loss  # Track discriminator loss
             
             # Update progress bar on main process
             if accelerator.is_main_process:
                 progress_bar.set_postfix({
                     "G_loss": f"{g_loss.item():.4f}",
-                    "D_loss": f"{d_loss.item():.4f}"
+                    "D_loss": f"{dis_loss:.4f}"
                 })
                 progress_bar.update(1)
             
@@ -219,7 +222,7 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
                     outputs["loss_perc"],
                     outputs["loss_vgg"],
                     g_loss_adv.item(),
-                    d_loss.item()
+                    dis_loss
                 )            
     except Exception as e:
         print(f"Error in train_epoch: {str(e)}")
@@ -230,7 +233,7 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
     # Set gradient clipping
     torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
     
-    return total_g_loss / len(train_dataloader), total_d_loss / (len(train_dataloader) // 2)
+    return total_g_loss / len(train_dataloader), total_a_loss / len(train_dataloader), total_d_loss / (len(train_dataloader) // args.discriminator_update_freq + 1)
 
 def validate(generator, val_loader, epoch, device, args, accelerator):
     """Validate the model"""
@@ -354,13 +357,13 @@ def main(args):
     # Create separate optimizers
     optimizer_G = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, generator.parameters()),
-        lr=args.learning_rate,
+        lr=args.learning_rate_g,
         weight_decay=args.weight_decay
     )
     
     optimizer_D = torch.optim.AdamW(
         discriminator.parameters(),
-        lr=args.learning_rate,
+        lr=args.learning_rate_d,
         weight_decay=args.weight_decay
     )
 
@@ -404,14 +407,14 @@ def main(args):
         
             with autocast():
                 generator.train()
-                train_g_loss, train_d_loss = train_epoch(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
+                train_g_loss, train_a_loss, train_d_loss = train_epoch(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
             
             
             # Run validation every 5 epochs
             
             generator.eval()
             val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator)
-            logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Train D loss: {train_d_loss:.4f}, Val loss: {val_loss:.4f}")
+            logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Train A loss: {train_a_loss:.4f}, Train D loss: {train_d_loss:.4f}, Val loss: {val_loss:.4f}")
             
             scheduler_G.step()
             scheduler_D.step()
@@ -425,6 +428,7 @@ def main(args):
                     'learning_rate_G': current_lr_G,
                     'learning_rate_D': current_lr_D,
                     'epoch_train_g_loss': train_g_loss,
+                    'epoch_train_a_loss': train_a_loss,
                     'epoch_train_d_loss': train_d_loss,
                     'epoch_val_loss': val_loss,
                 })

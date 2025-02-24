@@ -57,16 +57,18 @@ accelerate launch \
     --batch_size $PER_GPU_BATCH_SIZE \
     --num_epochs 400 \
     --start_epoch 0 \
-    --learning_rate 1e-4 \
+    --learning_rate_g 1e-4 \
+    --learning_rate_d 1e-5 \
     --weight_decay 0.01 \
     --num_workers 1 \
+    --discriminator_update_freq 2 \
     --lambda_sparsity 0.0 \
     --lambda_smoothness 0.0 \
     --lambda_answer 0.0 \
     --loss_recon 1.0 \
     --loss_perc 0.0 \
     --loss_vgg 0.0 \
-    --loss_gen 0.005 \
+    --loss_gen 0.2 \
     --loss_disc 0.5 \
     --log_interval 400 \
     --sample_interval 100 \
@@ -90,15 +92,17 @@ echo "accelerate launch \
     --batch_size $PER_GPU_BATCH_SIZE \
     --num_epochs 400 \
     --start_epoch 0 \
-    --learning_rate 1e-4 \
+    --learning_rate_g 1e-4 \
+    --learning_rate_d 1e-5 \
     --weight_decay 0.01 \
     --num_workers 1 \
+    --discriminator_update_freq 10 \
     --lambda_sparsity 0.0 \
     --lambda_smoothness 0.0 \
     --lambda_answer 0.0 \
     --loss_recon 1.0 \
     --loss_perc 0.0 \
-    --loss_vgg 10.0 \
+    --loss_vgg 0.0 \
     --loss_gen 0.2 \
     --loss_disc 0.5 \
     --log_interval 400 \

@@ -13,8 +13,10 @@ def parse_args():
     parser.add_argument("--mixed_precision", type=str, default="fp16",
                        choices=["no", "fp16", "bf16"],
                        help="Mixed precision training mode")
-    parser.add_argument("--learning_rate", type=float, default=5e-5,
-                       help="Initial learning rate")
+    parser.add_argument("--learning_rate_g", type=float, default=5e-5,
+                       help="Initial learning rate for generator")
+    parser.add_argument("--learning_rate_d", type=float, default=5e-5,
+                       help="Initial learning rate for discriminator")
     parser.add_argument("--weight_decay", type=float, default=0.01,
                        help="Weight decay for AdamW")
     parser.add_argument("--num_epochs", type=int, default=10,
@@ -43,6 +45,10 @@ def parse_args():
     parser.add_argument('--loss_gen', type=float, default=0.1, help='Weight for generator adversarial loss')
     parser.add_argument('--loss_disc', type=float, default=1.0, help='Weight for discriminator loss')
     
+    # Add discriminator update frequency argument
+    parser.add_argument("--discriminator_update_freq", type=int, default=20,
+                       help="Frequency of discriminator updates (in batches)")
+    
     # Logging arguments
     parser.add_argument('--log_interval', type=int, default=10)
     parser.add_argument('--sample_interval', type=int, default=100,
@@ -62,4 +68,4 @@ def parse_args():
     parser.add_argument('--val_category', type=str,
                        help='Category to use for validation (optional)', default=None)
     
-    return parser.parse_args() 
+    return parser.parse_args()

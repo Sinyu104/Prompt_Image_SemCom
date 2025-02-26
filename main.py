@@ -130,6 +130,7 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
     total_g_loss = 0
     total_d_loss = 0
     total_a_loss = 0
+    total_disc_update = 0
     
     optimizer_G, optimizer_D = optimizer  # Unpack optimizers
 
@@ -165,33 +166,36 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
             
             accelerator.backward(g_loss)
             optimizer_G.step()
-
-            if batch_idx % args.discriminator_update_freq == 0:
-                optimizer_D.zero_grad()
+            with autocast():
+                # Discriminator predictions
+                real_pred = discriminator(batch['image'])
+                fake_pred = discriminator(generated_images.detach())
                 
-                with autocast():
-                    # Discriminator predictions
-                    real_pred = discriminator(batch['image'])
-                    fake_pred = discriminator(generated_images.detach())
-                    
-                    # Calculate discriminator losses
-                    d_loss_real = adv_loss(real_pred, torch.ones_like(real_pred))
-                    d_loss_fake = adv_loss(fake_pred, torch.zeros_like(fake_pred))
-                    d_loss = (d_loss_real + d_loss_fake) * 0.5
+                # Calculate discriminator losses
+                d_loss_real = adv_loss(real_pred, torch.ones_like(real_pred))
+                d_loss_fake = adv_loss(fake_pred, torch.zeros_like(fake_pred))
+                d_loss = (d_loss_real + d_loss_fake) * 0.5
+
+            should_update_dis = g_loss_adv.item() <= 0.65 or d_loss.item() >= 0.65
+            should_update_dis = accelerator.gather_for_metrics(torch.tensor(should_update_dis, device=device))
+            should_update_dis = should_update_dis.any().item()  # Ensure all ranks agree
+
+            if should_update_dis:
+                total_disc_update += 1
+                optimizer_D.zero_grad()
                 
                 accelerator.backward(d_loss)
                 optimizer_D.step()
 
             total_g_loss += g_loss.item()  # Track generator loss
             total_a_loss += g_loss_adv.item()  # Track VGG loss
-            dis_loss = d_loss.item() if batch_idx % args.discriminator_update_freq == 0 else 0.0
-            total_d_loss += dis_loss  # Track discriminator loss
+            total_d_loss += d_loss.item()  # Track discriminator loss
             
             # Update progress bar on main process
             if accelerator.is_main_process:
                 progress_bar.set_postfix({
-                    "G_loss": f"{g_loss.item():.4f}",
-                    "D_loss": f"{dis_loss:.4f}"
+                    "A_loss": f"{g_loss_adv.item():.4f}",
+                    "D_loss": f"{d_loss.item():.4f}"
                 })
                 progress_bar.update(1)
             
@@ -222,8 +226,14 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
                     outputs["loss_perc"],
                     outputs["loss_vgg"],
                     g_loss_adv.item(),
-                    dis_loss
-                )            
+                    d_loss.item()
+                )  
+        if accelerator.is_main_process :
+            logger.debug(
+                "Epoch %d stats - Disc updates: %d",
+                epoch,
+                total_disc_update
+            ) 
     except Exception as e:
         print(f"Error in train_epoch: {str(e)}")
         if torch.distributed.is_initialized():
@@ -233,7 +243,7 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
     # Set gradient clipping
     torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
     
-    return total_g_loss / len(train_dataloader), total_a_loss / len(train_dataloader), total_d_loss / (len(train_dataloader) // args.discriminator_update_freq + 1)
+    return total_g_loss / len(train_dataloader), total_a_loss / len(train_dataloader), total_d_loss / len(train_dataloader)
 
 def validate(generator, val_loader, epoch, device, args, accelerator):
     """Validate the model"""
@@ -411,7 +421,6 @@ def main(args):
             
             
             # Run validation every 5 epochs
-            
             generator.eval()
             val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator)
             logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Train A loss: {train_a_loss:.4f}, Train D loss: {train_d_loss:.4f}, Val loss: {val_loss:.4f}")

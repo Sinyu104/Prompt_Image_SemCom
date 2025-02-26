@@ -236,8 +236,6 @@ def visualize_batch(image, generated_images, question, gt_answer, epoch, batch_i
         f'{mode}_visualizations': wandb.Image(plt),
         'epoch': epoch,
         'batch': batch_idx,
-        'question': question,
-        'ground_truth_answer': gt_answer
     })
     
     plt.close()

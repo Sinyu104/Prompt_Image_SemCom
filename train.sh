@@ -30,10 +30,10 @@ PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
 # Directory paths
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
-OUTPUT_DIR="$HOME/prompt_image_segment/outputs/$(date +%Y%m%d_%H%M%S)"
-# OUTPUT_DIR="$HOME/prompt_image_segment/outputs/20250218_215427"
-# RESUME_DIR="$HOME/prompt_image_segment/outputs/20250218_215427/checkpoint_epoch_94_loss_2.4744.pth"
-RESUME_DIR=None
+# OUTPUT_DIR="$HOME/prompt_image_segment/outputs/$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="$HOME/prompt_image_segment/outputs/20250225_164551"
+RESUME_DIR="$HOME/prompt_image_segment/outputs/20250225_164551/checkpoints/checkpoint_epoch_6_loss_1.5905.pth"
+# RESUME_DIR=None
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -49,14 +49,14 @@ accelerate launch \
     --multi_gpu \
     --num_processes $NUM_GPUS \
     --mixed_precision fp16 \
-    --gradient_accumulation_steps 2 \
+    --gradient_accumulation_steps 1 \
     --num_machines 1 \
     main.py \
     --data_dir $DATA_DIR \
     --output_dir $OUTPUT_DIR \
     --batch_size $PER_GPU_BATCH_SIZE \
     --num_epochs 400 \
-    --start_epoch 0 \
+    --start_epoch 7 \
     --learning_rate_g 1e-4 \
     --learning_rate_d 1e-5 \
     --weight_decay 0.01 \
@@ -67,8 +67,8 @@ accelerate launch \
     --lambda_answer 0.0 \
     --loss_recon 1.0 \
     --loss_perc 0.0 \
-    --loss_vgg 0.0 \
-    --loss_gen 0.2 \
+    --loss_vgg 10.0\
+    --loss_gen 1.0 \
     --loss_disc 0.5 \
     --log_interval 400 \
     --sample_interval 100 \
@@ -84,7 +84,7 @@ echo "accelerate launch \
     --multi_gpu \
     --num_processes $NUM_GPUS \
     --mixed_precision fp16 \
-    --gradient_accumulation_steps 2 \
+    --gradient_accumulation_steps 1 \
     --num_machines 1 \
     main.py \
     --data_dir $DATA_DIR \
@@ -102,8 +102,8 @@ echo "accelerate launch \
     --lambda_answer 0.0 \
     --loss_recon 1.0 \
     --loss_perc 0.0 \
-    --loss_vgg 0.0 \
-    --loss_gen 0.2 \
+    --loss_vgg 10.0 \
+    --loss_gen 0.1 \
     --loss_disc 0.5 \
     --log_interval 400 \
     --sample_interval 100 \

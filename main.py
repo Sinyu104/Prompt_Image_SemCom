@@ -21,6 +21,7 @@ import gc
 from accelerate import DistributedDataParallelKwargs
 import torch.cuda.amp
 import torch.nn as nn
+import torch.nn.functional as F
 import bitsandbytes as bnb  
 from torch.cuda.amp import autocast, GradScaler
 import argparse
@@ -121,6 +122,23 @@ def calculate_total_loss(outputs, args):
     
     return total_loss
 
+def feature_matching_loss(discriminator, real_images, fake_images, loss_fn=F.l1_loss):
+    """
+    Computes the feature matching loss between real and fake images using the discriminator's intermediate features.
+    Assumes discriminator.get_intermediate_features(x) returns a list of intermediate feature maps.
+    """
+    # Get real features (detached so gradients do not flow into D for real images)
+    with torch.no_grad():
+        real_feats = discriminator.get_intermediate_features(real_images)
+        real_feats = [f.detach() for f in real_feats]
+    # Get fake features (allow gradients to flow into generator)
+    fake_feats = discriminator.get_intermediate_features(fake_images)
+    
+    fm_loss = 0.0
+    for real_feat, fake_feat in zip(real_feats, fake_feats):
+        fm_loss += loss_fn(fake_feat, real_feat)
+    return fm_loss
+
 def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, device, args, accelerator):
     """Train for one epoch with separate generator and discriminator steps"""
     torch.autograd.set_detect_anomaly(True)
@@ -157,11 +175,14 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
                 generated_images = torch.clamp(generated_images, 0, 1)
                 fake_pred = discriminator(generated_images)
                 g_loss_adv = adv_loss(fake_pred, torch.ones_like(fake_pred))
+
+                fm_loss = feature_matching_loss(discriminator, batch['image'], generated_images)
+                
                 
                 g_loss = (
                     args.loss_recon * outputs['loss_recon'] +  
                     args.loss_vgg * outputs['loss_vgg'] +
-                    args.loss_gen * g_loss_adv
+                    args.loss_gen * (g_loss_adv + fm_loss)
                 )
             
             accelerator.backward(g_loss)
@@ -195,6 +216,7 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
             if accelerator.is_main_process:
                 progress_bar.set_postfix({
                     "A_loss": f"{g_loss_adv.item():.4f}",
+                    "FM_loss": f"{fm_loss.item():.4f}",
                     "D_loss": f"{d_loss.item():.4f}"
                 })
                 progress_bar.update(1)
@@ -220,12 +242,13 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
             
             if accelerator.is_main_process and batch_idx % args.log_interval == 0:
                 logger.debug(
-                    "Batch %d stats - Loss components: recon=%.4f, perc=%.4f, vgg=%.4f, g_loss=%.4f, d_loss=%.4f",
+                    "Batch %d stats - Loss components: recon=%.4f, perc=%.4f, vgg=%.4f, g_loss=%.4f, fm_loss=%4f, d_loss=%.4f",
                     batch_idx,
                     outputs["loss_recon"],
                     outputs["loss_perc"],
                     outputs["loss_vgg"],
                     g_loss_adv.item(),
+                    fm_loss.item(),
                     d_loss.item()
                 )  
         if accelerator.is_main_process :

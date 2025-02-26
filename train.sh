@@ -30,9 +30,9 @@ PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
 # Directory paths
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
-# OUTPUT_DIR="$HOME/prompt_image_segment/outputs/$(date +%Y%m%d_%H%M%S)"
-OUTPUT_DIR="$HOME/prompt_image_segment/outputs/20250225_164551"
-RESUME_DIR="$HOME/prompt_image_segment/outputs/20250225_164551/checkpoints/checkpoint_epoch_6_loss_1.5905.pth"
+OUTPUT_DIR="$HOME/prompt_image_segment/outputs/$(date +%Y%m%d_%H%M%S)"
+# OUTPUT_DIR="$HOME/prompt_image_segment/outputs/20250225_164551"
+RESUME_DIR="$HOME/prompt_image_segment/outputs/checkpoint_epoch_317_loss_1.4211.pth"
 # RESUME_DIR=None
 
 # Create output directory
@@ -45,7 +45,7 @@ export LOGLEVEL=DEBUG
 python3 -c "import torch; torch.cuda.empty_cache()"
 
 # Run training script with arguments
-accelerate launch \
+TRAIN_CMD="accelerate launch \
     --multi_gpu \
     --num_processes $NUM_GPUS \
     --mixed_precision fp16 \
@@ -67,7 +67,7 @@ accelerate launch \
     --lambda_answer 0.0 \
     --loss_recon 1.0 \
     --loss_perc 0.0 \
-    --loss_vgg 10.0\
+    --loss_vgg 10.0 \
     --loss_gen 1.0 \
     --loss_disc 0.5 \
     --log_interval 400 \
@@ -76,39 +76,11 @@ accelerate launch \
     --split_level2 subject \
     --train_category animal \
     --val_category human \
-    --resume_from_checkpoint $RESUME_DIR \
-   
+    --resume_from_checkpoint $RESUME_DIR"
+
+# Execute the training command
+eval $TRAIN_CMD
+
 # Save training command and arguments
 echo "Training command and arguments:" > "$OUTPUT_DIR/training_args.txt"
-echo "accelerate launch \
-    --multi_gpu \
-    --num_processes $NUM_GPUS \
-    --mixed_precision fp16 \
-    --gradient_accumulation_steps 1 \
-    --num_machines 1 \
-    main.py \
-    --data_dir $DATA_DIR \
-    --output_dir $OUTPUT_DIR \
-    --batch_size $PER_GPU_BATCH_SIZE \
-    --num_epochs 400 \
-    --start_epoch 0 \
-    --learning_rate_g 1e-4 \
-    --learning_rate_d 1e-5 \
-    --weight_decay 0.01 \
-    --num_workers 1 \
-    --discriminator_update_freq 10 \
-    --lambda_sparsity 0.0 \
-    --lambda_smoothness 0.0 \
-    --lambda_answer 0.0 \
-    --loss_recon 1.0 \
-    --loss_perc 0.0 \
-    --loss_vgg 10.0 \
-    --loss_gen 0.1 \
-    --loss_disc 0.5 \
-    --log_interval 400 \
-    --sample_interval 100 \
-    --split_type image_based \
-    --split_level2 subject \
-    --train_category animal \
-    --val_category human \
-    --resume_from_checkpoint $RESUME_DIR"  >> "$OUTPUT_DIR/training_args.txt" 
+echo "$TRAIN_CMD" >> "$OUTPUT_DIR/training_args.txt"

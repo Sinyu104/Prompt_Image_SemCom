@@ -24,15 +24,15 @@ export NUMEXPR_NUM_THREADS=8  # NumExpr parallelism
 
 
 # Set initial batch size (will be divided by number of GPUs)
-TOTAL_BATCH_SIZE=128  # Further reduce batch size
+TOTAL_BATCH_SIZE=16  # Further reduce batch size
 NUM_GPUS=4
 PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
 # Directory paths
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
-OUTPUT_DIR="$HOME/prompt_image_segment/outputs/$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="$HOME/prompt_image_segment/outputs/tuned_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
 # OUTPUT_DIR="$HOME/prompt_image_segment/outputs/20250225_164551"
-RESUME_DIR="$HOME/prompt_image_segment/outputs/checkpoint_epoch_317_loss_1.4211.pth"
+RESUME_DIR="$HOME/prompt_image_segment/outputs/checkpoint_epoch_36_loss_1.1505.pth"
 # RESUME_DIR=None
 
 # Create output directory
@@ -56,7 +56,7 @@ TRAIN_CMD="accelerate launch \
     --output_dir $OUTPUT_DIR \
     --batch_size $PER_GPU_BATCH_SIZE \
     --num_epochs 400 \
-    --start_epoch 7 \
+    --start_epoch 0 \
     --learning_rate_g 1e-4 \
     --learning_rate_d 1e-5 \
     --weight_decay 0.01 \
@@ -70,7 +70,7 @@ TRAIN_CMD="accelerate launch \
     --loss_vgg 10.0 \
     --loss_gen 1.0 \
     --loss_disc 0.5 \
-    --log_interval 400 \
+    --log_interval 200 \
     --sample_interval 100 \
     --split_type image_based \
     --split_level2 subject \

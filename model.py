@@ -39,6 +39,7 @@ import torch.nn.functional as F
 from transformers import GenerationConfig
 import torchvision
 from torchvision import models
+import torch.nn.utils.spectral_norm as spectral_norm
 
 
 logger = logging.get_logger(__name__)
@@ -2002,27 +2003,28 @@ class PatchGANDiscriminator(nn.Module):
         super().__init__()
         self.model = nn.Sequential(
             # First layer: no normalization, stride=2 reduces resolution.
-            nn.Conv2d(in_channels, base_channels, kernel_size=4, stride=2, padding=1),
+            spectral_norm(nn.Conv2d(in_channels, base_channels, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
             
             # Second layer: increase channels, stride=2.
-            nn.Conv2d(base_channels, base_channels * 2, kernel_size=4, stride=2, padding=1),
+            spectral_norm(nn.Conv2d(base_channels, base_channels * 2, kernel_size=4, stride=2, padding=1)),
             nn.InstanceNorm2d(base_channels * 2),
             nn.LeakyReLU(0.2, inplace=True),
             
             # Third layer: increase channels, stride=2.
-            nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=4, stride=2, padding=1),
+            spectral_norm(nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=4, stride=2, padding=1)),
             nn.InstanceNorm2d(base_channels * 4),
             nn.LeakyReLU(0.2, inplace=True),
             
             # Fourth layer: use stride=1 to capture local details.
-            nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size=4, stride=1, padding=1),
+            spectral_norm(nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size=4, stride=1, padding=1)),
             nn.InstanceNorm2d(base_channels * 8),
             nn.LeakyReLU(0.2, inplace=True),
             
             # Final output layer: output a 1-channel prediction map.
-            nn.Conv2d(base_channels * 8, 1, kernel_size=4, stride=1, padding=1)
+            spectral_norm(nn.Conv2d(base_channels * 8, 1, kernel_size=4, stride=1, padding=1))
         )
+        self.apply(self._init_weights)  # Apply weight initialization
         
     def forward(self, x):
         # Add input validation
@@ -2044,6 +2046,10 @@ class PatchGANDiscriminator(nn.Module):
             if isinstance(layer, nn.LeakyReLU):
                 features.append(x)
         return features
-
-
-
+    
+    def _init_weights(self, m):
+        """Weight initialization for Conv2d layers"""
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)

@@ -1276,10 +1276,10 @@ class CLIPSegDecoder(nn.Module):
         # Enable gradient checkpointing to save memory
         self.gradient_checkpointing = True
         
-        depth = len(config.extract_layers)
+        self.depth = len(config.extract_layers)
         
         self.fusion_layers = nn.ModuleList([GatedFusion(config.reduce_dim) 
-                                   for _ in range(depth)])
+                                   for _ in range(self.depth)])
 
         self.upsample_blocks = nn.ModuleList([
             nn.Sequential(
@@ -1294,9 +1294,9 @@ class CLIPSegDecoder(nn.Module):
             nn.Conv2d(config.reduce_dim, config.reduce_dim, kernel_size=3, padding=1),
                 nn.LeakyReLU(0.2, inplace=False)
             )
-            for _ in range(depth)]
+            for _ in range(self.depth)]
         )
-        self.emb_upsample = nn.ModuleList([NStepUpsample(config.reduce_dim, n_steps=i+1) for i in range(depth-1)])
+        self.emb_upsample = nn.ModuleList([NStepUpsample(config.reduce_dim, n_steps=i+1) for i in range(self.depth-1)])
         self.conv_blocks = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(config.reduce_dim*2, config.reduce_dim, kernel_size=3, padding=1),
@@ -1306,7 +1306,7 @@ class CLIPSegDecoder(nn.Module):
                 nn.InstanceNorm2d(config.reduce_dim),  # Use ch after conv
                 nn.LeakyReLU(0.2, inplace=False)
             )
-            for _ in range(depth)]
+            for _ in range(self.depth)]
         )
         
         # Final convolution block: gradually reduce channels to 3.
@@ -1330,12 +1330,13 @@ class CLIPSegDecoder(nn.Module):
         decoder_config.num_attention_heads = config.decoder_num_attention_heads
         decoder_config.intermediate_size = config.decoder_intermediate_size
         decoder_config.hidden_act = "relu"
-        # self.decoder_layers = nn.ModuleList([CLIPSegDecoderLayer(decoder_config) for _ in range(len(config.extract_layers))])
+        self.decoder_layers_global = nn.ModuleList([CLIPSegDecoderLayer(decoder_config) for _ in range(len(config.extract_layers)-1)])
+        self.decoder_layers_local = nn.ModuleList([CLIPSegDecoderLayer(decoder_config) for _ in range(len(config.extract_layers)-1)])
 
     def forward(
         self,
-        hidden_states: Tuple[torch.Tensor],
-        local_embeddings: torch.Tensor,
+        global_embedding: torch.Tensor,
+        local_embedding: torch.Tensor,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = True,
@@ -1343,9 +1344,22 @@ class CLIPSegDecoder(nn.Module):
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
-        global_embeddings = hidden_states[::-1]
-        local_embeddings = local_embeddings[::-1]
+        # global_embeddings = hidden_states[::-1]
+        # local_embeddings = local_embeddings[::-1]
 
+        global_embeddings = [global_embedding]
+        local_embeddings = [local_embedding]
+
+        for i in range(self.depth-1):
+            global_embeddings.append(self.decoder_layers_global[i](global_embeddings[-1], attention_mask=None,
+                    causal_attention_mask=None,
+                    output_attentions=output_attentions
+            )[0])
+            local_embeddings.append(self.decoder_layers_local[i](local_embeddings[-1], attention_mask=None,
+                    causal_attention_mask=None,
+                    output_attentions=output_attentions
+            )[0])
+            
         output = None
         for i, (global_embedding, local_embedding, upsample) in enumerate(zip(global_embeddings, local_embeddings, self.upsample_blocks)):
             # Combine global and local features using gated fusion
@@ -1409,11 +1423,9 @@ class TextOrientedImageGeneration(nn.Module):
         for param in self.clip.parameters():
             param.requires_grad = False
         self.extract_layers = config.extract_layers
-        self.film_mul = nn.ModuleList([nn.Linear(config.projection_dim, config.reduce_dim) for _ in range(len(self.extract_layers))])
-        self.film_add = nn.ModuleList([nn.Linear(config.projection_dim, config.reduce_dim) for _ in range(len(self.extract_layers))])
-        self.reduces = nn.ModuleList(
-            [nn.Linear(config.vision_config.hidden_size, config.reduce_dim) for _ in range(len(self.extract_layers))]
-        )
+        self.film_mul = nn.Linear(config.projection_dim, config.reduce_dim)
+        self.film_add = nn.Linear(config.projection_dim, config.reduce_dim)
+        self.reduces = nn.Linear(config.vision_config.hidden_size, config.reduce_dim)
         
         self.decoder = CLIPSegDecoder(config)
         
@@ -1423,12 +1435,11 @@ class TextOrientedImageGeneration(nn.Module):
     def _init_weights(self):
         """Initialize the weights"""
         # Initialize linear layers
-        for module_list in [self.film_mul, self.film_add, self.reduces]:
-            for module in module_list:
-                if isinstance(module, nn.Linear): 
-                    module.weight.data.normal_(mean=0.0, std=0.02)
-                    if module.bias is not None:
-                        module.bias.data.zero_()
+        for module in [self.film_mul, self.film_add, self.reduces]:
+            if isinstance(module, nn.Linear): 
+                module.weight.data.normal_(mean=0.0, std=0.02)
+                if module.bias is not None:
+                    module.bias.data.zero_()
 
     def get_conditional_embeddings(
         self,
@@ -1554,20 +1565,18 @@ class TextOrientedImageGeneration(nn.Module):
                     "Make sure that the feature dimension of the conditional embeddings matches"
                     " `config.projection_dim`."
                 )
-        global_embeddings = []
-        local_embeddings = []
-        for i, (activation, reduce) in enumerate(zip(activations, self.reduces)):
-            activation = reduce(activation)
-            global_embeddings.append(activation)
-            local_embedding = self.film_mul[i](conditional_embeddings) * activation.permute(1, 0, 2) + self.film_add[i](conditional_embeddings)
-            local_embeddings.append(local_embedding.permute(1, 0, 2))
+        
+        
+        global_embedding = self.reduces(activations[-1])
+        local_embedding = self.film_mul(conditional_embeddings) * global_embedding.permute(1, 0, 2) + self.film_add(conditional_embeddings)
+        local_embedding = local_embedding.permute(1, 0, 2)
 
 
 
         # step 3: forward through decoder
         decoder_outputs = self.decoder(
-            global_embeddings,
-            local_embeddings,
+            global_embedding,
+            local_embedding,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,

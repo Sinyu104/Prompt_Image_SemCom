@@ -42,6 +42,8 @@ def parse_args():
                        help='Weight for perceptual loss')
     parser.add_argument('--loss_vgg', type=float, default=10.0, 
                        help='Weight for VGG perceptual loss')
+    parser.add_argument('--loss_quant', type=float, default=0.1, 
+                       help='Weight for quantization loss')
     parser.add_argument('--loss_gen', type=float, default=0.1, help='Weight for generator adversarial loss')
     parser.add_argument('--loss_disc', type=float, default=1.0, help='Weight for discriminator loss')
     

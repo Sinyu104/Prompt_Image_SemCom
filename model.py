@@ -132,6 +132,7 @@ class CLIPSegImageSegmentationOutput(ModelOutput):
 
     loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
+    quantization_loss: torch.FloatTensor = None
     conditional_embeddings: torch.FloatTensor = None
     pooled_output: torch.FloatTensor = None
     vision_model_output: BaseModelOutputWithPooling = None
@@ -1417,6 +1418,14 @@ class TextOrientedImageGeneration(nn.Module):
         
         self.decoder = CLIPSegDecoder(config)
         
+        # Add the vector quantizer
+        self.quantizer = VectorQuantizer(
+            num_embeddings=32,  # 32 codes in codebook
+            embedding_dim=32,   # 32-bit codes
+            commitment_cost=0.25,
+            total_dim=config.reduce_dim,
+        )
+        
         # Initialize weights
         self._init_weights()
         
@@ -1556,12 +1565,20 @@ class TextOrientedImageGeneration(nn.Module):
                 )
         global_embeddings = []
         local_embeddings = []
+        quantization_loss = 0
+        
         for i, (activation, reduce) in enumerate(zip(activations, self.reduces)):
             activation = reduce(activation)
-            global_embeddings.append(activation)
-            local_embedding = self.film_mul[i](conditional_embeddings) * activation.permute(1, 0, 2) + self.film_add[i](conditional_embeddings)
-            local_embeddings.append(local_embedding.permute(1, 0, 2))
+            quantized_activation, q_loss, _ = self.quantizer(activation)
+            global_embeddings.append(quantized_activation)
+            quantization_loss += q_loss
+            
 
+            local_embedding = self.film_mul[i](conditional_embeddings) * activation.permute(1, 0, 2) + self.film_add[i](conditional_embeddings)
+            quantized_activation, q_loss, _ = self.quantizer(local_embedding.permute(1, 0, 2))
+            local_embeddings.append(quantized_activation)
+            quantization_loss += q_loss
+            
 
 
         # step 3: forward through decoder
@@ -1588,65 +1605,12 @@ class TextOrientedImageGeneration(nn.Module):
         return CLIPSegImageSegmentationOutput(
             loss=loss,
             logits=logits,
+            quantization_loss=quantization_loss,
             conditional_embeddings=conditional_embeddings,
             pooled_output=pooled_output,
             vision_model_output=vision_outputs,
             decoder_output=decoder_outputs,
         )
-
-    def visualize_outputs(self, images, questions, outputs, save_dir="visualizations"):
-        """Visualize model outputs including original, mask, masked image and answer"""
-        import matplotlib.pyplot as plt
-        import os
-        from datetime import datetime
-        
-        # Create save directory if it doesn't exist
-        os.makedirs(save_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        batch_size = images.shape[0]
-        for i in range(batch_size):
-            # Create subplot
-            fig, axs = plt.subplots(2, 2, figsize=(15, 15))
-            fig.suptitle(f'Question: {questions[i]}\nAnswer: {outputs["answers"][i]}', wrap=True)
-            
-            # Original image
-            img = images[i].cpu().numpy()
-            if img.shape[0] == 3:  # If channels first
-                img = np.transpose(img, (1, 2, 0))
-            axs[0, 0].imshow(img)
-            axs[0, 0].set_title('Original Image')
-            axs[0, 0].axis('off')
-            
-            # Segmentation mask
-            mask = outputs['segmentation_masks'][i].cpu().numpy()
-            axs[0, 1].imshow(mask, cmap='jet')
-            axs[0, 1].set_title('Segmentation Mask')
-            axs[0, 1].axis('off')
-            
-            # Masked image
-            masked_img = outputs['masked_images'][i].cpu().numpy()
-            if masked_img.shape[0] == 3:
-                masked_img = np.transpose(masked_img, (1, 2, 0))
-            axs[1, 0].imshow(masked_img)
-            axs[1, 0].set_title('Masked Image')
-            axs[1, 0].axis('off')
-            
-            # Overlay mask on original
-            overlay = img.copy()
-            mask_rgb = np.stack([mask]*3, axis=2)
-            overlay = overlay * 0.7 + mask_rgb * 0.3
-            axs[1, 1].imshow(overlay)
-            axs[1, 1].set_title('Overlay')
-            axs[1, 1].axis('off')
-            
-            # Save plot
-            plt.tight_layout()
-            save_path = os.path.join(save_dir, f'visualization_{timestamp}_{i}.png')
-            plt.savefig(save_path)
-            plt.close()
-            
-            print(f"Saved visualization to {save_path}")
 
 
 class AnswerGenerationModel(nn.Module):
@@ -1894,6 +1858,7 @@ class VQAWithSegmentation(nn.Module):
         inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         outputs = self.image_generation_model(**inputs)
         generated_images = outputs.logits  # Keep batch dimension
+        quantization_loss = outputs.quantization_loss
         
         # --------------------
         # 1. Reconstruction Loss
@@ -1919,6 +1884,7 @@ class VQAWithSegmentation(nn.Module):
             'loss_recon': recon_loss,
             'loss_perc': 0,
             'loss_vgg': vgg_loss,
+            'quantization_loss': quantization_loss,
         }
 
 __all__ = [
@@ -1929,67 +1895,6 @@ __all__ = [
     "CLIPSegForImageSegmentation",
 ]
 
-
-def tensor_to_pil(tensor, image_mean=(0.5, 0.5, 0.5), image_std=(0.5, 0.5, 0.5), rescale_factor=1/255, data_format="channels_first"):
-    """
-    Converts a PyTorch tensor back to a PIL Image by reversing preprocessing transformations.
-    For Tanh activation, input tensor range is [-1, 1]
-    """
-    # Remove batch dimension if present
-    if tensor.ndim == 4:  
-        tensor = tensor.squeeze(0)
-
-    # Ensure the tensor is in NumPy format
-    array = tensor.detach().cpu().numpy()
-
-    # Reverse channel formatting if needed
-    if data_format == "channels_first":
-        array = np.transpose(array, (1, 2, 0))
-
-    # For Tanh output: Convert from [-1, 1] to [0, 1] first
-    array = (array + 1) / 2
-    # Then apply normalization reversal
-    array = (array * np.array(image_std)) + np.array(image_mean)
-
-    # Reverse rescaling
-    array = array / rescale_factor
-
-    # Clip values
-    array = np.clip(array, 0, 255).astype(np.uint8)
-
-    return Image.fromarray(array)
-
-
-class ChannelAttention(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channels, channels // 2),
-            nn.LeakyReLU(0.2, inplace=False),
-            nn.Linear(channels // 2, channels),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y.expand_as(x)
-
-class ColorEnhancementModule(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.enhance = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=1),
-            nn.LeakyReLU(0.2, inplace=False),
-            nn.Conv2d(channels, channels, kernel_size=1, groups=3),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x):
-        enhanced = self.enhance(x)
-        return x * enhanced  
 
 class PatchGANDiscriminator(nn.Module):
     def __init__(self, in_channels=3, base_channels=64):
@@ -2053,3 +1958,78 @@ class PatchGANDiscriminator(nn.Module):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
+
+class VectorQuantizer(nn.Module):
+    def __init__(self, num_embeddings=32, embedding_dim=32, commitment_cost=0.25, total_dim=512):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.commitment_cost = commitment_cost
+        self.num_groups = total_dim // embedding_dim
+        
+        # Create separate embedding tables for each group
+        self.embeds = nn.ModuleList([
+            nn.Embedding(num_embeddings, embedding_dim)
+            for _ in range(self.num_groups)
+        ])
+        
+        # Initialize embedding weights
+        for embed in self.embeds:
+            embed.weight.data.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
+
+    def forward(self, inputs):
+        # Input shape: [..., total_dim]
+        input_shape = inputs.shape
+        flat_input = inputs.view(-1, input_shape[-1])
+        
+        # Split input into groups
+        grouped_inputs = flat_input.view(-1, self.num_groups, self.embedding_dim)
+        
+        total_loss = 0
+        quantized_list = []
+        indices_list = []
+        
+        # Process each group separately
+        for i, embed in enumerate(self.embeds):
+            group_input = grouped_inputs[:, i, :]
+
+            group_input = group_input / (group_input.norm(dim=1, keepdim=True) + 1e-6)
+            
+            # Calculate distances for this group
+            distances = (torch.sum(group_input**2, dim=1, keepdim=True) 
+                        + torch.sum(embed.weight**2, dim=1)
+                        - 2 * torch.matmul(group_input, embed.weight.t()))
+            
+            # Encoding
+            encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+            encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=inputs.device)
+            encodings.scatter_(1, encoding_indices, 1)
+            
+            # Quantize
+            quantized = torch.matmul(encodings, embed.weight)
+            
+            # Loss for this group
+            e_latent_loss = torch.mean((quantized.detach() - group_input)**2)
+            q_latent_loss = torch.mean((quantized - group_input.detach())**2)
+            group_loss = q_latent_loss + self.commitment_cost * e_latent_loss
+            
+            total_loss += group_loss
+            
+            # Straight through estimator
+            quantized = group_input + (quantized - group_input).detach()
+            
+            
+            quantized_list.append(quantized)
+            indices_list.append(encoding_indices)
+        
+        # Combine quantized vectors and reshape
+        quantized = torch.stack(quantized_list, dim=1)
+        quantized = quantized.view(*input_shape)
+        
+        # Stack all indices
+        encoding_indices = torch.cat(indices_list, dim=1)
+        
+        # Average loss across groups
+        total_loss = total_loss / self.num_groups
+        
+        return quantized, total_loss, encoding_indices

@@ -30,9 +30,9 @@ PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
 # Directory paths
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
-OUTPUT_DIR="$HOME/prompt_image_segment/outputs/tuned_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="$HOME/prompt_image_segment/outputs/codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
 # OUTPUT_DIR="$HOME/prompt_image_segment/outputs/20250225_164551"
-RESUME_DIR="$HOME/prompt_image_segment/outputs/checkpoint_epoch_36_loss_1.1505.pth"
+RESUME_DIR="$HOME/prompt_image_segment/outputs/tuned_reduce_dim_512_20250228_001923/checkpoints/checkpoint_epoch_138_loss_0.9707.pth"
 # RESUME_DIR=None
 
 # Create output directory
@@ -68,6 +68,7 @@ TRAIN_CMD="accelerate launch \
     --loss_recon 1.0 \
     --loss_perc 0.0 \
     --loss_vgg 10.0 \
+    --loss_quant 0.1
     --loss_gen 1.0 \
     --loss_disc 0.5 \
     --log_interval 200 \

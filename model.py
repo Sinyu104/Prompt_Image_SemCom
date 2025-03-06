@@ -2050,6 +2050,8 @@ class VectorQuantizer(nn.Module):
                 # Normalize the cluster sizes (optional normalization trick)
                 n = self.ema_cluster_size[i].sum()
                 cluster_size_normalized = ((self.ema_cluster_size[i] + self.epsilon) / (n + self.num_embeddings * self.epsilon)) * n
+                # Ensure cluster_size_normalized is never zero
+                cluster_size_normalized = torch.clamp(cluster_size_normalized, min=self.epsilon)
                 # Update codebook: new code = EMA weight divided by normalized cluster size
                 new_embed = self.ema_weight[i] / cluster_size_normalized.unsqueeze(1)
                 embed.weight.data.copy_(new_embed)

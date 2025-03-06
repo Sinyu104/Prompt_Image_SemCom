@@ -2041,20 +2041,21 @@ class VectorQuantizer(nn.Module):
 
             # EMA update (only during training)
             if self.training:
-                # Compute the sum over the batch for this group
-                cluster_size = encodings.sum(0)  # shape: [num_embeddings]
-                embed_sum = torch.matmul(encodings.t(), group_input)  # shape: [num_embeddings, embedding_dim]
-                # EMA update for this group's cluster sizes and weights
-                self.ema_cluster_size[i] = self.decay * self.ema_cluster_size[i] + (1 - self.decay) * cluster_size
-                self.ema_weight[i] = self.decay * self.ema_weight[i] + (1 - self.decay) * embed_sum
-                # Normalize the cluster sizes (optional normalization trick)
-                n = self.ema_cluster_size[i].sum()
-                cluster_size_normalized = ((self.ema_cluster_size[i] + self.epsilon) / (n + self.num_embeddings * self.epsilon)) * n
-                # Ensure cluster_size_normalized is never zero
-                cluster_size_normalized = torch.clamp(cluster_size_normalized, min=self.epsilon)
-                # Update codebook: new code = EMA weight divided by normalized cluster size
-                new_embed = self.ema_weight[i] / cluster_size_normalized.unsqueeze(1)
-                embed.weight.data.copy_(new_embed)
+                with torch.no_grad():
+                    # Compute the sum over the batch for this group
+                    cluster_size = encodings.sum(0)  # shape: [num_embeddings]
+                    embed_sum = torch.matmul(encodings.t(), group_input)  # shape: [num_embeddings, embedding_dim]
+                    # EMA update for this group's cluster sizes and weights
+                    self.ema_cluster_size[i] = self.decay * self.ema_cluster_size[i] + (1 - self.decay) * cluster_size
+                    self.ema_weight[i] = self.decay * self.ema_weight[i] + (1 - self.decay) * embed_sum
+                    # Normalize the cluster sizes (optional normalization trick)
+                    n = self.ema_cluster_size[i].sum()
+                    cluster_size_normalized = ((self.ema_cluster_size[i] + self.epsilon) / (n + self.num_embeddings * self.epsilon)) * n
+                    # Ensure cluster_size_normalized is never zero
+                    cluster_size_normalized = torch.clamp(cluster_size_normalized, min=self.epsilon)
+                    # Update codebook: new code = EMA weight divided by normalized cluster size
+                    new_embed = self.ema_weight[i] / cluster_size_normalized.unsqueeze(1)
+                    embed.weight.data.copy_(new_embed)
         
         # Combine quantized vectors and reshape
         quantized = torch.stack(quantized_list, dim=1)

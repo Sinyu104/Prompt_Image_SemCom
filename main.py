@@ -182,7 +182,7 @@ def feature_matching_loss(discriminator, real_images, fake_images, loss_fn=F.l1_
 
 def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, device, args, accelerator):
     """Train for one epoch with separate generator and discriminator steps"""
-    torch.autograd.set_detect_anomaly(True)  # Enable anomaly detection
+    # torch.autograd.set_detect_anomaly(True)  # Enable anomaly detection
     
     logger = logging.getLogger('training')
     generator.train()

@@ -167,7 +167,8 @@ def cleanup_distributed():
     """Cleanup distributed training resources"""
     if dist.is_initialized():
         dist.destroy_process_group()
-
+        
+@torch.no_grad()
 def visualize_batch(image, generated_images, question, gt_answer, epoch, batch_idx, args, mode='train'):
     """Visualize a batch of images and save to wandb."""
     logger = logging.getLogger('training')

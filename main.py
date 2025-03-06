@@ -215,9 +215,9 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
                 generated_images = torch.clamp(generated_images, 0, 1)
     
                 # Compute the critic (discriminator) score on fake images
-                fake_score = discriminator(generated_images)
+                # fake_score = discriminator(generated_images)
                 # WGAN generator loss: maximize fake_score, so minimize negative score
-                g_loss_adv = -fake_score.mean()
+                # g_loss_adv = -fake_score.mean()
                 
                 # Feature matching loss from discriminator intermediate features
                 # fm_loss = feature_matching_loss(discriminator, batch['image'], generated_images)
@@ -226,8 +226,7 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
                 g_loss = (
                     args.loss_recon * outputs['loss_recon'] +
                     args.loss_vgg   * outputs['loss_vgg'] +
-                    args.loss_quant * outputs['quantization_loss'] +
-                    args.loss_gen   * g_loss_adv 
+                    args.loss_quant * outputs['quantization_loss'] 
                 )
             for name, param in generator.named_parameters():
                 if param.grad is not None and torch.isnan(param.grad).any():
@@ -238,38 +237,38 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
             torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
             optimizer_G.step()
 
-            if batch_idx % args.discriminator_update_freq == 0:
-                optimizer_D.zero_grad()
-                with autocast():
-                    # Compute scores on real and fake images
-                    real_score = discriminator(batch['image'])
-                    fake_score = discriminator(generated_images.detach())
-                    # WGAN discriminator loss: maximize (real_score - fake_score), so minimize negative of that
-                    d_loss_adv = -(real_score.mean() - fake_score.mean())
+            # if batch_idx % args.discriminator_update_freq == 0:
+            #     optimizer_D.zero_grad()
+            #     with autocast():
+            #         # Compute scores on real and fake images
+            #         real_score = discriminator(batch['image'])
+            #         fake_score = discriminator(generated_images.detach())
+            #         # WGAN discriminator loss: maximize (real_score - fake_score), so minimize negative of that
+            #         d_loss_adv = -(real_score.mean() - fake_score.mean())
                     
-                    # Compute gradient penalty
-                    gp = gradient_penalty(discriminator, batch['image'], generated_images.detach(), device, lambda_gp=lambda_gp)
+            #         # Compute gradient penalty
+            #         gp = gradient_penalty(discriminator, batch['image'], generated_images.detach(), device, lambda_gp=lambda_gp)
                     
-                    logger.debug(f"Gradient penalty: {gp}, Discriminator loss: {d_loss_adv}")
+            #         logger.debug(f"Gradient penalty: {gp}, Discriminator loss: {d_loss_adv}")
                     
-                    # Total discriminator loss: adversarial loss + weighted gradient penalty
-                    d_loss = d_loss_adv + lambda_gp * gp
+            #         # Total discriminator loss: adversarial loss + weighted gradient penalty
+            #         d_loss = d_loss_adv + lambda_gp * gp
                     
-                accelerator.backward(d_loss)
-                # Clip gradients for discriminator
-                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
-                optimizer_D.step()
+            #     accelerator.backward(d_loss)
+            #     # Clip gradients for discriminator
+            #     torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+            #     optimizer_D.step()
 
             total_g_loss += g_loss.item()  # Track generator loss
-            total_a_loss += g_loss_adv.item()  # Track VGG loss
-            total_d_loss += d_loss.item()  # Track discriminator loss
+            # total_a_loss += g_loss_adv.item()  # Track VGG loss
+            # total_d_loss += d_loss.item()  # Track discriminator loss
             total_q_loss += outputs['quantization_loss'].item()  # Track quantization loss
             
             # Update progress bar on main process
             if accelerator.is_main_process:
                 progress_bar.set_postfix({
-                    "A_loss": f"{g_loss_adv.item():.4f}",
-                    "D_loss": f"{d_loss.item():.4f}"
+                    "G_loss": f"{g_loss.item():.4f}",
+                    # "D_loss": f"{d_loss.item():.4f}"
                 })
                 progress_bar.update(1)
             
@@ -294,14 +293,11 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
             
             if accelerator.is_main_process and batch_idx % args.log_interval == 0:
                 logger.debug(
-                    "Batch %d stats - Loss components: recon=%.4f, perc=%.4f, vgg=%.4f, g_loss=%.4f, gp=%4f, d_loss=%.4f",
+                    "Batch %d stats - Loss components: recon=%.4f, perc=%.4f, vgg=%.4f",
                     batch_idx,
                     outputs["loss_recon"],
                     outputs["loss_perc"],
                     outputs["loss_vgg"],
-                    g_loss_adv.item(),
-                    gp,
-                    d_loss.item()
                 )  
         
     except Exception as e:

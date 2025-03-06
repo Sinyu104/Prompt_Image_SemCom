@@ -24,12 +24,12 @@ from transformers import AutoTokenizer
 from transformers import CLIPVisionModel, CLIPImageProcessor  # Add this import at the top
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
-from llava.conversation import conv_templates
-from llava.utils import disable_torch_init
-from llava.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path
+# from llava.conversation import conv_templates
+# from llava.utils import disable_torch_init
+# from llava.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path
 from PIL import Image
 import numpy as np
-from llava.constants import IMAGE_TOKEN_INDEX
+# from llava.constants import IMAGE_TOKEN_INDEX
 import os
 import matplotlib.pyplot as plt
 from transformers import BitsAndBytesConfig
@@ -1419,8 +1419,14 @@ class TextOrientedImageGeneration(nn.Module):
         self.decoder = CLIPSegDecoder(config)
         
         # Add the vector quantizer
-        self.quantizer = VectorQuantizer(
-            num_embeddings=32,  # 32 codes in codebook
+        self.global_quantizer = VectorQuantizer(
+            num_embeddings=64,  # 64 codes in codebook
+            embedding_dim=32,   # 32-bit codes
+            commitment_cost=0.25,
+            total_dim=config.reduce_dim,
+        )
+        self.local_quantizer = VectorQuantizer(
+            num_embeddings=64,  # 64 codes in codebook
             embedding_dim=32,   # 32-bit codes
             commitment_cost=0.25,
             total_dim=config.reduce_dim,
@@ -1569,13 +1575,13 @@ class TextOrientedImageGeneration(nn.Module):
         
         for i, (activation, reduce) in enumerate(zip(activations, self.reduces)):
             activation = reduce(activation)
-            quantized_activation, q_loss, _ = self.quantizer(activation)
+            quantized_activation, q_loss, _ = self.global_quantizer(activation)
             global_embeddings.append(quantized_activation)
             quantization_loss += q_loss
             
 
             local_embedding = self.film_mul[i](conditional_embeddings) * activation.permute(1, 0, 2) + self.film_add[i](conditional_embeddings)
-            quantized_activation, q_loss, _ = self.quantizer(local_embedding.permute(1, 0, 2))
+            quantized_activation, q_loss, _ = self.local_quantizer(local_embedding.permute(1, 0, 2))
             local_embeddings.append(quantized_activation)
             quantization_loss += q_loss
             
@@ -1959,13 +1965,21 @@ class PatchGANDiscriminator(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
+def is_main_process():
+    """Check if this is the main process in DDP training or single process training"""
+    if not torch.distributed.is_initialized():
+        return True
+    return torch.distributed.get_rank() == 0
+
 class VectorQuantizer(nn.Module):
-    def __init__(self, num_embeddings=32, embedding_dim=32, commitment_cost=0.25, total_dim=512):
+    def __init__(self, num_embeddings=32, embedding_dim=32, commitment_cost=0.25, total_dim=512, decay=0.99, epsilon=1e-5):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.commitment_cost = commitment_cost
         self.num_groups = total_dim // embedding_dim
+        self.decay = decay
+        self.epsilon = epsilon
         
         # Create separate embedding tables for each group
         self.embeds = nn.ModuleList([
@@ -1976,6 +1990,9 @@ class VectorQuantizer(nn.Module):
         # Initialize embedding weights
         for embed in self.embeds:
             embed.weight.data.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
+
+        self.register_buffer("ema_cluster_size", torch.zeros(self.num_groups, self.num_embeddings))
+        self.register_buffer("ema_weight", torch.zeros(self.num_groups, self.num_embeddings, self.embedding_dim))
 
     def forward(self, inputs):
         # Input shape: [..., total_dim]
@@ -2021,6 +2038,21 @@ class VectorQuantizer(nn.Module):
             
             quantized_list.append(quantized)
             indices_list.append(encoding_indices)
+
+            # EMA update (only during training)
+            if self.training:
+                # Compute the sum over the batch for this group
+                cluster_size = encodings.sum(0)  # shape: [num_embeddings]
+                embed_sum = torch.matmul(encodings.t(), group_input)  # shape: [num_embeddings, embedding_dim]
+                # EMA update for this group's cluster sizes and weights
+                self.ema_cluster_size[i] = self.decay * self.ema_cluster_size[i] + (1 - self.decay) * cluster_size
+                self.ema_weight[i] = self.decay * self.ema_weight[i] + (1 - self.decay) * embed_sum
+                # Normalize the cluster sizes (optional normalization trick)
+                n = self.ema_cluster_size[i].sum()
+                cluster_size_normalized = ((self.ema_cluster_size[i] + self.epsilon) / (n + self.num_embeddings * self.epsilon)) * n
+                # Update codebook: new code = EMA weight divided by normalized cluster size
+                new_embed = self.ema_weight[i] / cluster_size_normalized.unsqueeze(1)
+                embed.weight.data.copy_(new_embed)
         
         # Combine quantized vectors and reshape
         quantized = torch.stack(quantized_list, dim=1)

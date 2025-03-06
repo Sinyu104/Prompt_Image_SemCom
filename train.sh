@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Set environment variables
-export CUDA_VISIBLE_DEVICES=0,1,2,3  # Use all 4 GPUs
+export CUDA_VISIBLE_DEVICES=0,1,2  # Use all 4 GPUs
 export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128,garbage_collection_threshold:0.6"
 export TORCH_DISTRIBUTED_DEBUG=DETAIL  # Add debug info
 export NCCL_DEBUG=WARNING
@@ -24,16 +24,16 @@ export NUMEXPR_NUM_THREADS=8  # NumExpr parallelism
 
 
 # Set initial batch size (will be divided by number of GPUs)
-TOTAL_BATCH_SIZE=16  # Further reduce batch size
-NUM_GPUS=4
+TOTAL_BATCH_SIZE=9  # Further reduce batch size
+NUM_GPUS=3
 PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
 # Directory paths
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
-OUTPUT_DIR="$HOME/prompt_image_segment/outputs/codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
 # OUTPUT_DIR="$HOME/prompt_image_segment/outputs/20250225_164551"
-RESUME_DIR="$HOME/prompt_image_segment/outputs/tuned_reduce_dim_512_20250228_001923/checkpoints/checkpoint_epoch_138_loss_0.9707.pth"
-# RESUME_DIR=None
+# RESUME_DIR="$HOME/prompt_image_segment/outputs/codebook_reduce_dim_512_20250304_231036/checkpoints/checkpoint_epoch_54_loss_1.5045.pth"
+RESUME_DIR=None
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -68,8 +68,8 @@ TRAIN_CMD="accelerate launch \
     --loss_recon 1.0 \
     --loss_perc 0.0 \
     --loss_vgg 10.0 \
-    --loss_quant 0.1
-    --loss_gen 1.0 \
+    --loss_quant 1.0 \
+    --loss_gen 0.0 \
     --loss_disc 0.5 \
     --log_interval 200 \
     --sample_interval 100 \

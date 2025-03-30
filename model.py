@@ -1224,22 +1224,6 @@ class CLIPSegDecoderLayer(nn.Module):
 
         return outputs
 
-class GatedFusion(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.gate = nn.Sequential(
-            nn.Linear(dim * 2, dim),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, global_emb, local_emb):
-        # Ensure both embeddings have same shape: [batch_size, seq_len, dim]
-        if global_emb.dim() != local_emb.dim():
-            raise ValueError(f"Dimension mismatch: global_emb: {global_emb.shape}, local_emb: {local_emb.shape}")
-        
-        # Compute dynamic gate
-        gate = self.gate(torch.cat([global_emb, local_emb], dim=-1))
-        return gate * global_emb + (1 - gate) * local_emb
 
 class NStepUpsample(nn.Module):
     def __init__(self, channels, n_steps):
@@ -1279,8 +1263,6 @@ class CLIPSegDecoder(nn.Module):
         
         self.depth = len(config.extract_layers)
         
-        self.fusion_layers = nn.ModuleList([GatedFusion(config.reduce_dim) 
-                                   for _ in range(self.depth)])
 
         self.upsample_blocks = nn.ModuleList([
             nn.Sequential(
@@ -1336,8 +1318,7 @@ class CLIPSegDecoder(nn.Module):
 
     def forward(
         self,
-        global_embedding: torch.Tensor,
-        local_embedding: torch.Tensor,
+        hidden_states: Tuple[torch.Tensor],
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = True,
@@ -1345,26 +1326,12 @@ class CLIPSegDecoder(nn.Module):
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
-        # global_embeddings = hidden_states[::-1]
-        # local_embeddings = local_embeddings[::-1]
+        local_embeddings = hidden_states[::-1]
 
-        global_embeddings = [global_embedding]
-        local_embeddings = [local_embedding]
-
-        for i in range(self.depth-1):
-            global_embeddings.append(self.decoder_layers_global[i](global_embeddings[-1], attention_mask=None,
-                    causal_attention_mask=None,
-                    output_attentions=output_attentions
-            )[0])
-            local_embeddings.append(self.decoder_layers_local[i](local_embeddings[-1], attention_mask=None,
-                    causal_attention_mask=None,
-                    output_attentions=output_attentions
-            )[0])
-            
         output = None
-        for i, (global_embedding, local_embedding, upsample) in enumerate(zip(global_embeddings, local_embeddings, self.upsample_blocks)):
+        for i, (local_embedding, upsample) in enumerate(zip(local_embeddings, self.upsample_blocks)):
             # Combine global and local features using gated fusion
-            combined_embedding = self.fusion_layers[i](global_embedding, local_embedding)[:, 1:, :] #Remove CLS token
+            combined_embedding = local_embedding[:, 1:, :] #Remove CLS token
             B, L, D = combined_embedding.shape
             H = int(math.sqrt(L))
             combined_embedding = combined_embedding.reshape(B, H, H, D).permute(0, 3, 1, 2)
@@ -1431,13 +1398,7 @@ class TextOrientedImageGeneration(nn.Module):
         self.decoder = CLIPSegDecoder(config)
         
         # Add the vector quantizer
-        self.global_quantizer = VectorQuantizer(
-            num_embeddings=64,  # 64 codes in codebook
-            embedding_dim=32,   # 32-bit codes
-            commitment_cost=0.25,
-            total_dim=config.reduce_dim,
-        )
-        self.local_quantizer = VectorQuantizer(
+        self.quantizer = VectorQuantizer(
             num_embeddings=64,  # 64 codes in codebook
             embedding_dim=32,   # 32-bit codes
             commitment_cost=0.25,
@@ -1586,13 +1547,10 @@ class TextOrientedImageGeneration(nn.Module):
         
         for i, (activation, reduce) in enumerate(zip(activations, self.reduces)):
             activation = reduce(activation)
-            quantized_activation, q_loss, _ = self.global_quantizer(activation)
-            global_embeddings.append(quantized_activation)
-            quantization_loss += q_loss
             
 
             local_embedding = self.film_mul[i](conditional_embeddings) * activation.permute(1, 0, 2) + self.film_add[i](conditional_embeddings)
-            quantized_activation, q_loss, _ = self.local_quantizer(local_embedding.permute(1, 0, 2))
+            quantized_activation, q_loss, _ = self.quantizer(local_embedding.permute(1, 0, 2))
             local_embeddings.append(quantized_activation)
             quantization_loss += q_loss
             
@@ -1600,8 +1558,7 @@ class TextOrientedImageGeneration(nn.Module):
 
         # step 3: forward through decoder
         decoder_outputs = self.decoder(
-            global_embedding,
-            local_embedding,
+            local_embeddings,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,

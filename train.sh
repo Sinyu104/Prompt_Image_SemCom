@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Set environment variables
-export CUDA_VISIBLE_DEVICES=0,1,2  # Use all 4 GPUs
+export CUDA_VISIBLE_DEVICES=0,1,2,3  # Use all 4 GPUs
 export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128,garbage_collection_threshold:0.6"
 export TORCH_DISTRIBUTED_DEBUG=DETAIL  # Add debug info
 export NCCL_DEBUG=WARNING
@@ -24,8 +24,8 @@ export NUMEXPR_NUM_THREADS=8  # NumExpr parallelism
 
 
 # Set initial batch size (will be divided by number of GPUs)
-TOTAL_BATCH_SIZE=9  # Further reduce batch size
-NUM_GPUS=3
+TOTAL_BATCH_SIZE=16  # Further reduce batch size
+NUM_GPUS=4
 PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
 # Directory paths

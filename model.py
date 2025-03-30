@@ -2062,3 +2062,88 @@ class PatchGANDiscriminator(nn.Module):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
+
+
+def is_main_process():
+    """Check if this is the main process in DDP training or single process training"""
+    if not torch.distributed.is_initialized():
+        return True
+    return torch.distributed.get_rank() == 0
+
+class VectorQuantizer(nn.Module):
+    def __init__(self, num_embeddings=32, embedding_dim=32, commitment_cost=0.25, total_dim=512, decay=0.99, epsilon=1e-5):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.commitment_cost = commitment_cost
+        self.num_groups = total_dim // embedding_dim
+        self.decay = decay
+        self.epsilon = epsilon
+        
+        # Create separate embedding tables for each group
+        self.embeds = nn.ModuleList([
+            nn.Embedding(num_embeddings, embedding_dim)
+            for _ in range(self.num_groups)
+        ])
+        
+        # Initialize embedding weights
+        for embed in self.embeds:
+            embed.weight.data.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
+
+    def forward(self, inputs):
+        # Input shape: [..., total_dim]
+        input_shape = inputs.shape
+        flat_input = inputs.view(-1, input_shape[-1])
+        
+        # Split input into groups
+        grouped_inputs = flat_input.view(-1, self.num_groups, self.embedding_dim)
+        
+        total_loss = 0
+        quantized_list = []
+        indices_list = []
+        
+        # Process each group separately
+        for i, embed in enumerate(self.embeds):
+            group_input = grouped_inputs[:, i, :]
+
+            group_input = group_input / (group_input.norm(dim=1, keepdim=True) + 1e-6)
+            
+            # Calculate distances for this group
+            distances = (torch.sum(group_input**2, dim=1, keepdim=True) 
+                        + torch.sum(embed.weight**2, dim=1)
+                        - 2 * torch.matmul(group_input, embed.weight.t()))
+            
+            # Encoding
+            encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+            encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=inputs.device)
+            encodings.scatter_(1, encoding_indices, 1)
+            
+            # Quantize
+            quantized = torch.matmul(encodings, embed.weight)
+            
+            # Loss for this group
+            e_latent_loss = torch.mean((quantized.detach() - group_input)**2)
+            q_latent_loss = torch.mean((quantized - group_input.detach())**2)
+            group_loss = q_latent_loss + self.commitment_cost * e_latent_loss
+            
+            total_loss += group_loss
+            
+            # Straight through estimator
+            quantized = group_input + (quantized - group_input).detach()
+            
+            
+            quantized_list.append(quantized)
+            indices_list.append(encoding_indices)
+
+        
+        # Combine quantized vectors and reshape
+        quantized = torch.stack(quantized_list, dim=1)
+        quantized = quantized.view(*input_shape)
+        
+        # Stack all indices
+        encoding_indices = torch.cat(indices_list, dim=1)
+        
+        # Average loss across groups
+        total_loss = total_loss / self.num_groups
+        
+        return quantized, total_loss, encoding_indices

@@ -1391,10 +1391,12 @@ class TextOrientedImageGeneration(nn.Module):
         for param in self.clip.parameters():
             param.requires_grad = False
         self.extract_layers = config.extract_layers
-        self.film_mul = nn.Linear(config.projection_dim, config.reduce_dim)
-        self.film_add = nn.Linear(config.projection_dim, config.reduce_dim)
-        self.reduces = nn.Linear(config.vision_config.hidden_size, config.reduce_dim)
-        
+        self.film_mul = nn.ModuleList([nn.Linear(config.projection_dim, config.reduce_dim) for _ in range(len(self.extract_layers))])
+        self.film_add = nn.ModuleList([nn.Linear(config.projection_dim, config.reduce_dim) for _ in range(len(self.extract_layers))])
+        self.reduces = nn.ModuleList(
+            [nn.Linear(config.vision_config.hidden_size, config.reduce_dim) for _ in range(len(self.extract_layers))]
+        )
+
         self.decoder = CLIPSegDecoder(config)
         
         # Add the vector quantizer
@@ -1541,7 +1543,7 @@ class TextOrientedImageGeneration(nn.Module):
                     "Make sure that the feature dimension of the conditional embeddings matches"
                     " `config.projection_dim`."
                 )
-        global_embeddings = []
+
         local_embeddings = []
         quantization_loss = 0
         

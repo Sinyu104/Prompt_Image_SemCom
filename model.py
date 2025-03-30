@@ -1991,9 +1991,6 @@ class VectorQuantizer(nn.Module):
         for embed in self.embeds:
             embed.weight.data.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
 
-        self.register_buffer("ema_cluster_size", torch.zeros(self.num_groups, self.num_embeddings))
-        self.register_buffer("ema_weight", torch.zeros(self.num_groups, self.num_embeddings, self.embedding_dim))
-
     def forward(self, inputs):
         # Input shape: [..., total_dim]
         input_shape = inputs.shape
@@ -2039,23 +2036,6 @@ class VectorQuantizer(nn.Module):
             quantized_list.append(quantized)
             indices_list.append(encoding_indices)
 
-            # EMA update (only during training)
-            if self.training:
-                with torch.no_grad():
-                    # Compute the sum over the batch for this group
-                    cluster_size = encodings.sum(0)  # shape: [num_embeddings]
-                    embed_sum = torch.matmul(encodings.t(), group_input)  # shape: [num_embeddings, embedding_dim]
-                    # EMA update for this group's cluster sizes and weights
-                    self.ema_cluster_size[i] = self.decay * self.ema_cluster_size[i] + (1 - self.decay) * cluster_size
-                    self.ema_weight[i] = self.decay * self.ema_weight[i] + (1 - self.decay) * embed_sum
-                    # Normalize the cluster sizes (optional normalization trick)
-                    n = self.ema_cluster_size[i].sum()
-                    cluster_size_normalized = ((self.ema_cluster_size[i] + self.epsilon) / (n + self.num_embeddings * self.epsilon)) * n
-                    # Ensure cluster_size_normalized is never zero
-                    cluster_size_normalized = torch.clamp(cluster_size_normalized, min=self.epsilon)
-                    # Update codebook: new code = EMA weight divided by normalized cluster size
-                    new_embed = self.ema_weight[i] / cluster_size_normalized.unsqueeze(1)
-                    embed.weight.data.copy_(new_embed)
         
         # Combine quantized vectors and reshape
         quantized = torch.stack(quantized_list, dim=1)

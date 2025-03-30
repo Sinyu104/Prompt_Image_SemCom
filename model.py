@@ -24,12 +24,12 @@ from transformers import AutoTokenizer
 from transformers import CLIPVisionModel, CLIPImageProcessor  # Add this import at the top
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
-from llava.conversation import conv_templates
-from llava.utils import disable_torch_init
-from llava.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path
+# from llava.conversation import conv_templates
+# from llava.utils import disable_torch_init
+# from llava.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path
 from PIL import Image
 import numpy as np
-from llava.constants import IMAGE_TOKEN_INDEX
+# from llava.constants import IMAGE_TOKEN_INDEX
 import os
 import matplotlib.pyplot as plt
 from transformers import BitsAndBytesConfig
@@ -132,6 +132,7 @@ class CLIPSegImageSegmentationOutput(ModelOutput):
 
     loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
+    quantization_loss: torch.FloatTensor = None
     conditional_embeddings: torch.FloatTensor = None
     pooled_output: torch.FloatTensor = None
     vision_model_output: BaseModelOutputWithPooling = None
@@ -1429,6 +1430,20 @@ class TextOrientedImageGeneration(nn.Module):
         
         self.decoder = CLIPSegDecoder(config)
         
+        # Add the vector quantizer
+        self.global_quantizer = VectorQuantizer(
+            num_embeddings=64,  # 64 codes in codebook
+            embedding_dim=32,   # 32-bit codes
+            commitment_cost=0.25,
+            total_dim=config.reduce_dim,
+        )
+        self.local_quantizer = VectorQuantizer(
+            num_embeddings=64,  # 64 codes in codebook
+            embedding_dim=32,   # 32-bit codes
+            commitment_cost=0.25,
+            total_dim=config.reduce_dim,
+        )
+        
         # Initialize weights
         self._init_weights()
         
@@ -1565,12 +1580,22 @@ class TextOrientedImageGeneration(nn.Module):
                     "Make sure that the feature dimension of the conditional embeddings matches"
                     " `config.projection_dim`."
                 )
+        global_embeddings = []
+        local_embeddings = []
+        quantization_loss = 0
         
-        
-        global_embedding = self.reduces(activations[-1])
-        local_embedding = self.film_mul(conditional_embeddings) * global_embedding.permute(1, 0, 2) + self.film_add(conditional_embeddings)
-        local_embedding = local_embedding.permute(1, 0, 2)
+        for i, (activation, reduce) in enumerate(zip(activations, self.reduces)):
+            activation = reduce(activation)
+            quantized_activation, q_loss, _ = self.global_quantizer(activation)
+            global_embeddings.append(quantized_activation)
+            quantization_loss += q_loss
+            
 
+            local_embedding = self.film_mul[i](conditional_embeddings) * activation.permute(1, 0, 2) + self.film_add[i](conditional_embeddings)
+            quantized_activation, q_loss, _ = self.local_quantizer(local_embedding.permute(1, 0, 2))
+            local_embeddings.append(quantized_activation)
+            quantization_loss += q_loss
+            
 
 
         # step 3: forward through decoder
@@ -1597,65 +1622,12 @@ class TextOrientedImageGeneration(nn.Module):
         return CLIPSegImageSegmentationOutput(
             loss=loss,
             logits=logits,
+            quantization_loss=quantization_loss,
             conditional_embeddings=conditional_embeddings,
             pooled_output=pooled_output,
             vision_model_output=vision_outputs,
             decoder_output=decoder_outputs,
         )
-
-    def visualize_outputs(self, images, questions, outputs, save_dir="visualizations"):
-        """Visualize model outputs including original, mask, masked image and answer"""
-        import matplotlib.pyplot as plt
-        import os
-        from datetime import datetime
-        
-        # Create save directory if it doesn't exist
-        os.makedirs(save_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        batch_size = images.shape[0]
-        for i in range(batch_size):
-            # Create subplot
-            fig, axs = plt.subplots(2, 2, figsize=(15, 15))
-            fig.suptitle(f'Question: {questions[i]}\nAnswer: {outputs["answers"][i]}', wrap=True)
-            
-            # Original image
-            img = images[i].cpu().numpy()
-            if img.shape[0] == 3:  # If channels first
-                img = np.transpose(img, (1, 2, 0))
-            axs[0, 0].imshow(img)
-            axs[0, 0].set_title('Original Image')
-            axs[0, 0].axis('off')
-            
-            # Segmentation mask
-            mask = outputs['segmentation_masks'][i].cpu().numpy()
-            axs[0, 1].imshow(mask, cmap='jet')
-            axs[0, 1].set_title('Segmentation Mask')
-            axs[0, 1].axis('off')
-            
-            # Masked image
-            masked_img = outputs['masked_images'][i].cpu().numpy()
-            if masked_img.shape[0] == 3:
-                masked_img = np.transpose(masked_img, (1, 2, 0))
-            axs[1, 0].imshow(masked_img)
-            axs[1, 0].set_title('Masked Image')
-            axs[1, 0].axis('off')
-            
-            # Overlay mask on original
-            overlay = img.copy()
-            mask_rgb = np.stack([mask]*3, axis=2)
-            overlay = overlay * 0.7 + mask_rgb * 0.3
-            axs[1, 1].imshow(overlay)
-            axs[1, 1].set_title('Overlay')
-            axs[1, 1].axis('off')
-            
-            # Save plot
-            plt.tight_layout()
-            save_path = os.path.join(save_dir, f'visualization_{timestamp}_{i}.png')
-            plt.savefig(save_path)
-            plt.close()
-            
-            print(f"Saved visualization to {save_path}")
 
 
 class AnswerGenerationModel(nn.Module):
@@ -1903,6 +1875,7 @@ class VQAWithSegmentation(nn.Module):
         inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         outputs = self.image_generation_model(**inputs)
         generated_images = outputs.logits  # Keep batch dimension
+        quantization_loss = outputs.quantization_loss
         
         # --------------------
         # 1. Reconstruction Loss
@@ -1928,6 +1901,7 @@ class VQAWithSegmentation(nn.Module):
             'loss_recon': recon_loss,
             'loss_perc': 0,
             'loss_vgg': vgg_loss,
+            'quantization_loss': quantization_loss,
         }
 
 __all__ = [
@@ -1938,67 +1912,6 @@ __all__ = [
     "CLIPSegForImageSegmentation",
 ]
 
-
-def tensor_to_pil(tensor, image_mean=(0.5, 0.5, 0.5), image_std=(0.5, 0.5, 0.5), rescale_factor=1/255, data_format="channels_first"):
-    """
-    Converts a PyTorch tensor back to a PIL Image by reversing preprocessing transformations.
-    For Tanh activation, input tensor range is [-1, 1]
-    """
-    # Remove batch dimension if present
-    if tensor.ndim == 4:  
-        tensor = tensor.squeeze(0)
-
-    # Ensure the tensor is in NumPy format
-    array = tensor.detach().cpu().numpy()
-
-    # Reverse channel formatting if needed
-    if data_format == "channels_first":
-        array = np.transpose(array, (1, 2, 0))
-
-    # For Tanh output: Convert from [-1, 1] to [0, 1] first
-    array = (array + 1) / 2
-    # Then apply normalization reversal
-    array = (array * np.array(image_std)) + np.array(image_mean)
-
-    # Reverse rescaling
-    array = array / rescale_factor
-
-    # Clip values
-    array = np.clip(array, 0, 255).astype(np.uint8)
-
-    return Image.fromarray(array)
-
-
-class ChannelAttention(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channels, channels // 2),
-            nn.LeakyReLU(0.2, inplace=False),
-            nn.Linear(channels // 2, channels),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y.expand_as(x)
-
-class ColorEnhancementModule(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.enhance = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=1),
-            nn.LeakyReLU(0.2, inplace=False),
-            nn.Conv2d(channels, channels, kernel_size=1, groups=3),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x):
-        enhanced = self.enhance(x)
-        return x * enhanced  
 
 class PatchGANDiscriminator(nn.Module):
     def __init__(self, in_channels=3, base_channels=64):
@@ -2062,7 +1975,6 @@ class PatchGANDiscriminator(nn.Module):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-
 
 def is_main_process():
     """Check if this is the main process in DDP training or single process training"""

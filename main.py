@@ -182,13 +182,14 @@ def feature_matching_loss(discriminator, real_images, fake_images, loss_fn=F.l1_
 
 def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, device, args, accelerator):
     """Train for one epoch with separate generator and discriminator steps"""
-    torch.autograd.set_detect_anomaly(True)  # Enable anomaly detection
+    # torch.autograd.set_detect_anomaly(True)  # Enable anomaly detection
     
     logger = logging.getLogger('training')
     generator.train()
     total_g_loss = 0
     total_d_loss = 0
     total_a_loss = 0
+    total_q_loss = 0
     lambda_gp = 10.0
 
     optimizer_G, optimizer_D = optimizer  # Unpack optimizers
@@ -205,12 +206,6 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
    
     try:
         for batch_idx, batch in enumerate(train_dataloader):
-            # Log input shapes
-            logger.debug(f"Batch {batch_idx} - Image shape: {batch['image'].shape}, Number of questions: {len(batch['question'])}")
-            
-            # Check for NaNs in input tensors
-            if torch.isnan(batch['image']).any():
-                raise ValueError("NaNs detected in input tensors")
             
             # Train Discriminator only on even batch indices
             optimizer_G.zero_grad()
@@ -220,9 +215,9 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
                 generated_images = torch.clamp(generated_images, 0, 1)
     
                 # Compute the critic (discriminator) score on fake images
-                fake_score = discriminator(generated_images)
+                # fake_score = discriminator(generated_images)
                 # WGAN generator loss: maximize fake_score, so minimize negative score
-                g_loss_adv = -fake_score.mean()
+                # g_loss_adv = -fake_score.mean()
                 
                 # Feature matching loss from discriminator intermediate features
                 # fm_loss = feature_matching_loss(discriminator, batch['image'], generated_images)
@@ -231,46 +226,49 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
                 g_loss = (
                     args.loss_recon * outputs['loss_recon'] +
                     args.loss_vgg   * outputs['loss_vgg'] +
-                    args.loss_gen   * g_loss_adv 
+                    args.loss_quant * outputs['quantization_loss'] 
                 )
-
+            for name, param in generator.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"NaN detected in gradients of {name}")
             accelerator.backward(g_loss)
             
             # Clip gradients for generator
             torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
             optimizer_G.step()
 
-            if batch_idx % args.discriminator_update_freq == 0:
-                optimizer_D.zero_grad()
-                with autocast():
-                    # Compute scores on real and fake images
-                    real_score = discriminator(batch['image'])
-                    fake_score = discriminator(generated_images.detach())
-                    # WGAN discriminator loss: maximize (real_score - fake_score), so minimize negative of that
-                    d_loss_adv = -(real_score.mean() - fake_score.mean())
+            # if batch_idx % args.discriminator_update_freq == 0:
+            #     optimizer_D.zero_grad()
+            #     with autocast():
+            #         # Compute scores on real and fake images
+            #         real_score = discriminator(batch['image'])
+            #         fake_score = discriminator(generated_images.detach())
+            #         # WGAN discriminator loss: maximize (real_score - fake_score), so minimize negative of that
+            #         d_loss_adv = -(real_score.mean() - fake_score.mean())
                     
-                    # Compute gradient penalty
-                    gp = gradient_penalty(discriminator, batch['image'], generated_images.detach(), device, lambda_gp=lambda_gp)
+            #         # Compute gradient penalty
+            #         gp = gradient_penalty(discriminator, batch['image'], generated_images.detach(), device, lambda_gp=lambda_gp)
                     
-                    logger.debug(f"Gradient penalty: {gp}, Discriminator loss: {d_loss_adv}")
+            #         logger.debug(f"Gradient penalty: {gp}, Discriminator loss: {d_loss_adv}")
                     
-                    # Total discriminator loss: adversarial loss + weighted gradient penalty
-                    d_loss = d_loss_adv + lambda_gp * gp
+            #         # Total discriminator loss: adversarial loss + weighted gradient penalty
+            #         d_loss = d_loss_adv + lambda_gp * gp
                     
-                accelerator.backward(d_loss)
-                # Clip gradients for discriminator
-                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
-                optimizer_D.step()
+            #     accelerator.backward(d_loss)
+            #     # Clip gradients for discriminator
+            #     torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+            #     optimizer_D.step()
 
             total_g_loss += g_loss.item()  # Track generator loss
-            total_a_loss += g_loss_adv.item()  # Track VGG loss
-            total_d_loss += d_loss.item()  # Track discriminator loss
+            # total_a_loss += g_loss_adv.item()  # Track VGG loss
+            # total_d_loss += d_loss.item()  # Track discriminator loss
+            total_q_loss += outputs['quantization_loss'].item()  # Track quantization loss
             
             # Update progress bar on main process
             if accelerator.is_main_process:
                 progress_bar.set_postfix({
-                    "A_loss": f"{g_loss_adv.item():.4f}",
-                    "D_loss": f"{d_loss.item():.4f}"
+                    "G_loss": f"{g_loss.item():.4f}",
+                    # "D_loss": f"{d_loss.item():.4f}"
                 })
                 progress_bar.update(1)
             
@@ -295,14 +293,11 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
             
             if accelerator.is_main_process and batch_idx % args.log_interval == 0:
                 logger.debug(
-                    "Batch %d stats - Loss components: recon=%.4f, perc=%.4f, vgg=%.4f, g_loss=%.4f, gp=%4f, d_loss=%.4f",
+                    "Batch %d stats - Loss components: recon=%.4f, perc=%.4f, vgg=%.4f",
                     batch_idx,
                     outputs["loss_recon"],
                     outputs["loss_perc"],
                     outputs["loss_vgg"],
-                    g_loss_adv.item(),
-                    gp,
-                    d_loss.item()
                 )  
         
     except Exception as e:
@@ -314,7 +309,7 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
     # Set gradient clipping
     torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
     
-    return total_g_loss / len(train_dataloader), total_a_loss / len(train_dataloader), total_d_loss / len(train_dataloader)
+    return total_g_loss / len(train_dataloader), total_a_loss / len(train_dataloader), total_d_loss / len(train_dataloader), total_q_loss / len(train_dataloader)
 
 def validate(generator, val_loader, epoch, device, args, accelerator):
     """Validate the model"""
@@ -496,7 +491,7 @@ def main(args):
         
             with autocast():
                 generator.train()
-                train_g_loss, train_a_loss, train_d_loss = train_epoch(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
+                train_g_loss, train_a_loss, train_d_loss, train_q_loss = train_epoch(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
             
             
             # Run validation every 5 epochs
@@ -518,6 +513,7 @@ def main(args):
                     'epoch_train_g_loss': train_g_loss,
                     'epoch_train_a_loss': train_a_loss,
                     'epoch_train_d_loss': train_d_loss,
+                    'epoch_train_q_loss': train_q_loss,
                     'epoch_val_loss': val_loss,
                 })
                 

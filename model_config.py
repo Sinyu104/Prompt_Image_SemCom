@@ -27,6 +27,19 @@ class VisionConfig:
             raise ValueError("patch_size must be positive")
 
 @dataclass
+class PhysicalConfig:
+    Nt: int = 64
+    Nr: int = 64
+    NRF: int = 2
+    Ns: int = 2
+    num_subcarriers: int = 64
+    noise_power: float = 1.0
+    M: int = 8
+    num_clusters: int = 5
+    num_rays: int = 10
+
+
+@dataclass
 class ModelConfig:
     llava_model_path: str
     clipseg_model_path: str
@@ -48,6 +61,7 @@ class ModelConfig:
     decoder_num_attention_heads: int
     extract_layers: List[int]
     vision_config: VisionConfig
+    physical_config: PhysicalConfig
     gradient_checkpointing: bool
     freeze_vision_tower: bool
     freeze_llm: bool
@@ -67,5 +81,24 @@ class ModelConfig:
         vision_cfg_data = config_data.pop('vision_config')
         vision_cfg = VisionConfig(**vision_cfg_data)
 
+        # Handle physical config
+        physical_cfg_data = config_data.pop('physical_config')
+        physical_cfg = PhysicalConfig(**physical_cfg_data)
+
         # Create ModelConfig instance with the remaining config data
-        return cls(vision_config=vision_cfg, **config_data)         
+        return cls(vision_config=vision_cfg, physical_config=physical_cfg, **config_data)  
+     
+    def override_with_args(self, args):
+        """
+        Override parts of the config using parsed command-line args.
+        """
+        for field in vars(args):
+            value = getattr(args, field)
+            if value is None:
+                continue
+            # Route overrides to the correct sub-config
+            if hasattr(self.physical_config, field):
+                setattr(self.physical_config, field, value)
+            elif hasattr(self, field):
+                setattr(self, field, value)
+      

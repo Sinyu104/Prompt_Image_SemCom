@@ -69,5 +69,18 @@ def parse_args():
                        help='Category to use for training (optional)', default=None)
     parser.add_argument('--val_category', type=str,
                        help='Category to use for validation (optional)', default=None)
+
+    # --- Physical Layer Overrides (optional, overrides config.json if used) ---
+    parser.add_argument("--Nt", type=int, default=None, help="Override number of transmit antennas")
+    parser.add_argument("--Nr", type=int, default=None, help="Override number of receive antennas")
+    parser.add_argument("--NRF", type=int, default=None, help="Override number of RF chains")
+    parser.add_argument("--Ns", type=int, default=None, help="Override number of data streams")
+    parser.add_argument("--num_subcarriers", type=int, default=None, help="Override number of OFDM subcarriers")
+    parser.add_argument("--noise_power", type=float, default=None, help="Override noise power")
+    parser.add_argument("--M", type=int, default=None, help="Override modulation order")
+
+    # --- Channel Parameter Overrides ---
+    parser.add_argument("--num_clusters", type=int, default=None, help="Override number of channel clusters")
+    parser.add_argument("--num_rays", type=int, default=None, help="Override number of rays per cluster")
     
     return parser.parse_args()

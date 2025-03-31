@@ -420,10 +420,12 @@ class HybridPrecoderModule(nn.Module):
         self.Nt = Nt
         self.NRF = NRF
         self.Ns = Ns
-        # Parameterize analog precoder by phases (real-valued)
-        self.analog_phases = nn.Parameter(torch.rand(Nt, NRF) * 2 * math.pi)
-        # Digital precoder (unconstrained complex)
-        self.digital_precoder = nn.Parameter(torch.randn(NRF, Ns, dtype=torch.cfloat))
+        self.register_buffer("analog_phases", torch.rand(Nt, NRF) * 2 * math.pi)
+        angles = torch.rand(NRF, Ns) * 2 * math.pi
+        self.register_buffer("digital_precoder", torch.exp(1j * angles))
+
+
+
     
     def get_analog_precoder(self):
         # Constant-modulus analog precoder: exp(j*phase)
@@ -446,8 +448,9 @@ class HybridCombinerModule(nn.Module):
         self.Nr = Nr
         self.NRF = NRF
         self.Ns = Ns
-        self.analog_phases = nn.Parameter(torch.rand(Nr, NRF) * 2 * math.pi)
-        self.digital_combiner = nn.Parameter(torch.randn(NRF, Ns, dtype=torch.cfloat))
+        self.register_buffer("analog_phases", torch.rand(Nr, NRF) * 2 * math.pi)
+        angles = torch.rand(NRF, Ns) * 2 * math.pi
+        self.register_buffer("digital_combiner", torch.exp(1j * angles))
     
     def get_analog_combiner(self):
         return torch.exp(1j * self.analog_phases)  # [Nr, NRF]
@@ -468,6 +471,7 @@ class PhysicalLayerModule(nn.Module):
           Nt, Nr, NRF, Ns, num_subcarriers, noise_power, and channel parameters.
         """
         super(PhysicalLayerModule, self).__init__()
+        self.M = config.M # Modulation order
         self.Nt = config.Nt
         self.Nr = config.Nr
         self.NRF = config.NRF
@@ -476,8 +480,11 @@ class PhysicalLayerModule(nn.Module):
         self.noise_power = config.noise_power  # scalar noise power
         
         # Channel parameters (for a geometry-based channel simulation)
-        self.num_clusters = config.get("num_clusters", 3)
-        self.num_rays = config.get("num_rays", 5)
+        self.num_clusters = config.num_clusters
+        self.num_rays = config.num_rays
+
+        # Initialize modulation model
+        self.mary_modulation = MAryModulation(M=self.M)
         
         # Initialize hybrid precoder and combiner modules
         self.precoder = HybridPrecoderModule(self.Nt, self.NRF, self.Ns)

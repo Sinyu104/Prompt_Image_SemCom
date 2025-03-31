@@ -40,7 +40,7 @@ from transformers import GenerationConfig
 import torchvision
 from torchvision import models
 import torch.nn.utils.spectral_norm as spectral_norm
-from channel import MAryModulation
+from channel import MAryModulation, PhysicalLayerModule
 
 
 logger = logging.get_logger(__name__)
@@ -1398,6 +1398,7 @@ class TextOrientedImageGeneration(nn.Module):
             [nn.Linear(config.vision_config.hidden_size, config.reduce_dim) for _ in range(len(self.extract_layers))]
         )
         self.mary_modulation = MAryModulation(M=8)
+        self.physical_modulation = PhysicalLayerModule(self.config.physical_config)
 
         self.decoder = CLIPSegDecoder(config)
         

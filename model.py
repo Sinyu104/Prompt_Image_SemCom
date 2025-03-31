@@ -40,6 +40,7 @@ from transformers import GenerationConfig
 import torchvision
 from torchvision import models
 import torch.nn.utils.spectral_norm as spectral_norm
+from channel import MAryModulation
 
 
 logger = logging.get_logger(__name__)
@@ -1326,7 +1327,7 @@ class CLIPSegDecoder(nn.Module):
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
-        local_embeddings = hidden_states[::-1]
+        local_embeddings = torch.flip(hidden_states, dims=[0])
 
         output = None
         for i, (local_embedding, upsample) in enumerate(zip(local_embeddings, self.upsample_blocks)):
@@ -1396,6 +1397,7 @@ class TextOrientedImageGeneration(nn.Module):
         self.reduces = nn.ModuleList(
             [nn.Linear(config.vision_config.hidden_size, config.reduce_dim) for _ in range(len(self.extract_layers))]
         )
+        self.mary_modulation = MAryModulation(M=8)
 
         self.decoder = CLIPSegDecoder(config)
         
@@ -1544,7 +1546,8 @@ class TextOrientedImageGeneration(nn.Module):
                     " `config.projection_dim`."
                 )
 
-        local_embeddings = []
+        transmitted_indices = []
+        quantized_activations = []
         quantization_loss = 0
         
         for i, (activation, reduce) in enumerate(zip(activations, self.reduces)):
@@ -1552,19 +1555,64 @@ class TextOrientedImageGeneration(nn.Module):
             
 
             local_embedding = self.film_mul[i](conditional_embeddings) * activation.permute(1, 0, 2) + self.film_add[i](conditional_embeddings)
-            quantized_activation, q_loss, _ = self.quantizer(local_embedding.permute(1, 0, 2))
-            local_embeddings.append(quantized_activation)
+            quantized_activation, q_loss, quantized_indices = self.quantizer(local_embedding.permute(1, 0, 2))
+            quantized_activations.append(quantized_activation)
             quantization_loss += q_loss
-            
+            # Use the indices for simulating the physical layer (non-differentiable)
+            transmitted_index = quantized_indices.detach()  # simulate transmission
+            transmitted_indices.append(transmitted_index)
+        
 
+        modulated = self.mary_modulation(transmitted_indices)  #  [L, B, len, group, 2] complex
+        received = self.mary_modulation.demodulate(modulated)  # [B, len, group] recovered indices
+        recovered_embedding = self.quantizer.recover_embeddings(received)
+        
+        # STE: replace hard recovered with soft quantized during backward
+        quantized_activations = torch.cat(quantized_activations, dim=0)
+        mixed_embedding = quantized_activations + (recovered_embedding - quantized_activations).detach()
+        
+        # mixed_embedding = quantized_activation
+        mixed_embedding = mixed_embedding.view(len(self.extract_layers), -1, mixed_embedding.shape[1], mixed_embedding.shape[2])
+        recovered_embedding = recovered_embedding.view(len(self.extract_layers), -1, recovered_embedding.shape[1], recovered_embedding.shape[2])
+        
+        # modulated_local_embeddings = []
+        # for emb in local_embeddings:
+        #     # emb shape: [B, seq_len, reduce_dim]
+        #     mod_emb, modulation_probs = self.mary_modulation(emb)
+        #     modulated_local_embeddings.append(mod_emb)
+        # # For example, we could combine the modulated embeddings (e.g. by averaging or concatenation)
+        # combined_modulated = torch.mean(torch.stack(modulated_local_embeddings, dim=0), dim=0)
+        # # Now, reshape the combined modulated embeddings to match the physical layer input.
+        # # For instance, assume we want a grid of shape [B, K, NS]:
+        # # (You may design this mapping based on your system parameters.)
+        # B = combined_modulated.shape[0]
+        # # Here we assume: total tokens = seq_len, and we choose K and NS such that K * NS equals that.
+        # K = self.config.num_subcarriers
+        # NS = self.config.NS  # symbols per subcarrier
+        # modulated_grid = combined_modulated.view(B, K, NS)
+        
+        # # === Step 5: Pass through the physical layer (hybrid beamforming) module ===
+        # transmitted_signal = self.physical_layer(modulated_grid)
+
+        # for embedding in local_embeddings:
+        #     recovered_embeddings.append(self.quantizer.recover_embeddings(embedding))
 
         # step 3: forward through decoder
-        decoder_outputs = self.decoder(
-            local_embeddings,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
+        if self.training:
+            decoder_outputs = self.decoder(
+                mixed_embedding,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+        else:
+            decoder_outputs = self.decoder(
+                recovered_embedding,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+
         logits = decoder_outputs.logits if return_dict else decoder_outputs[0]
 
         loss = None
@@ -1941,6 +1989,8 @@ def is_main_process():
         return True
     return torch.distributed.get_rank() == 0
 
+
+
 class VectorQuantizer(nn.Module):
     def __init__(self, num_embeddings=32, embedding_dim=32, commitment_cost=0.25, total_dim=512, decay=0.99, epsilon=1e-5):
         super().__init__()
@@ -1985,12 +2035,9 @@ class VectorQuantizer(nn.Module):
                         - 2 * torch.matmul(group_input, embed.weight.t()))
             
             # Encoding
-            encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
-            encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=inputs.device)
-            encodings.scatter_(1, encoding_indices, 1)
-            
-            # Quantize
-            quantized = torch.matmul(encodings, embed.weight)
+            encoding_indices = torch.argmin(distances, dim=1).long()  # shape: [N]
+            quantized = F.embedding(encoding_indices, embed.weight)  # shape: [N, embedding_dim]
+
             
             # Loss for this group
             e_latent_loss = torch.mean((quantized.detach() - group_input)**2)
@@ -2004,7 +2051,7 @@ class VectorQuantizer(nn.Module):
             
             
             quantized_list.append(quantized)
-            indices_list.append(encoding_indices)
+            indices_list.append(encoding_indices.unsqueeze(1))
 
         
         # Combine quantized vectors and reshape
@@ -2013,8 +2060,36 @@ class VectorQuantizer(nn.Module):
         
         # Stack all indices
         encoding_indices = torch.cat(indices_list, dim=1)
+        encoding_indices = encoding_indices.view(*input_shape[:-1], self.num_groups)
         
         # Average loss across groups
         total_loss = total_loss / self.num_groups
         
         return quantized, total_loss, encoding_indices
+
+    @staticmethod
+    def indices_to_embedding_ste(indices, embed_table):
+        indices = indices.long()
+        embedding = F.embedding(indices, embed_table)
+        return embedding + (embedding - embedding).detach()
+
+    def recover_embeddings(self, quantized_indices):
+        """
+        Given quantized indices (e.g. of shape [B, num_groups] or [B, seq_len, num_groups]),
+        recover the continuous embeddings using an embedding lookup with a straight-through estimator.
+        """
+        # Assume quantized_indices shape is [B, num_groups]
+        # (If it's [B, seq_len, num_groups], adjust accordingly.)
+        orig_shape = quantized_indices.shape[:-1]  # [...], excluding group dim
+        num_groups = quantized_indices.shape[-1]
+        flat_indices = quantized_indices.view(-1, num_groups)  # [N, num_groups]
+
+        recovered_list = []
+        for i, embed in enumerate(self.embeds):
+            indices = flat_indices[:, i]  # [N]
+            recovered = self.indices_to_embedding_ste(indices, embed.weight)  # [N, embedding_dim]
+            recovered_list.append(recovered)
+
+        recovered_flat = torch.cat(recovered_list, dim=-1)  # [N, total_dim]
+        recovered = recovered_flat.view(*orig_shape, -1)    # [..., total_dim]
+        return recovered

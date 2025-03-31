@@ -228,9 +228,6 @@ def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, de
                     args.loss_vgg   * outputs['loss_vgg'] +
                     args.loss_quant * outputs['quantization_loss'] 
                 )
-            for name, param in generator.named_parameters():
-                if param.grad is not None and torch.isnan(param.grad).any():
-                    print(f"NaN detected in gradients of {name}")
             accelerator.backward(g_loss)
             
             # Clip gradients for generator

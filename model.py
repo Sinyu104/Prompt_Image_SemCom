@@ -1400,6 +1400,8 @@ class TextOrientedImageGeneration(nn.Module):
 
         self.physical_layer = PhysicalLayerModule(self.config.physical_config, device=device)
 
+        self.RL_weight_agent = RLWeightingAgent(config.reduce_dim)
+
         self.decoder = CLIPSegDecoder(config)
         
         # Add the vector quantizer
@@ -1564,15 +1566,16 @@ class TextOrientedImageGeneration(nn.Module):
             transmitted_index = quantized_indices.detach()  # simulate transmission
             transmitted_indices.append(transmitted_index)
         
+        quantized_activations = torch.stack(quantized_activations, dim=0)
         if stage == 1:
             transmitted_indices = torch.stack(transmitted_indices, dim=0)
             received = transmitted_indices
         else:
-            received = self.physical_layer(transmitted_indices)  #  [B, len, group] recovered indices
+            importance_weight = self.rl_agent.policy_nets(quantized_activation)
+            received = self.physical_layer(transmitted_indices, importance_weight)  #  [B, len, group] recovered indices
         recovered_embedding = self.quantizer.recover_embeddings(received)
         
         # STE: replace hard recovered with soft quantized during backward
-        quantized_activations = torch.stack(quantized_activations, dim=0)
         mixed_embedding = quantized_activations + (recovered_embedding - quantized_activations).detach()
 
         # step 3: forward through decoder
@@ -2071,3 +2074,31 @@ class VectorQuantizer(nn.Module):
         recovered_flat = torch.cat(recovered_list, dim=-1)  # [N, total_dim]
         recovered = recovered_flat.view(*orig_shape, -1)    # [..., total_dim]
         return recovered
+    
+
+class RLWeightingAgent(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64):
+        """
+        Args:
+            input_dim (int): Dimension of the token embedding.
+            hidden_dim (int): Hidden size of the network.
+        """
+        super().__init__()
+        self.policy = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()  # Outputs importance weights ∈ (0, 1)
+        )
+
+    def forward(self, embeddings):
+        """
+        Args:
+            embeddings: Tensor [L, B, len, D]
+        Returns:
+            importance_weights: Tensor [L, B, len]
+        """
+        L, B, T, D = embeddings.shape
+        flat = embeddings.view(-1, D)  # [L * B * T, D]
+        weights = self.policy(flat).view(L, B, T)  # [L, B, len]
+        return weights

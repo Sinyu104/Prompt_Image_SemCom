@@ -427,7 +427,7 @@ class PhysicalLayerModule(nn.Module):
         return output_sequence
 
 
-    def forward(self, symbols):
+    def forward(self, symbols, weight=None):
         """
         Forward pass through hybrid precoding, MIMO-OFDM channel, and combining.
 

@@ -17,6 +17,8 @@ def parse_args():
                        help="Initial learning rate for generator")
     parser.add_argument("--learning_rate_d", type=float, default=5e-5,
                        help="Initial learning rate for discriminator")
+    parser.add_argument("--learning_rate_w", type=float, default=5e-5,
+                       help="Initial learning rate for discriminator")
     parser.add_argument("--weight_decay", type=float, default=0.01,
                        help="Weight decay for AdamW")
     parser.add_argument("--num_epochs_1", type=int, default=10,

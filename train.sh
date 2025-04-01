@@ -62,6 +62,7 @@ TRAIN_CMD="accelerate launch \
     --start_stage 1 \
     --learning_rate_g 1e-4 \
     --learning_rate_d 1e-5 \
+    --learning_rate_w 1e-4 \
     --weight_decay 0.01 \
     --num_workers 1 \
     --discriminator_update_freq 2 \

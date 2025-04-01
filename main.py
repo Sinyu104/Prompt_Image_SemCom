@@ -377,6 +377,97 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
     
     return total_g_loss / len(train_dataloader), total_a_loss / len(train_dataloader), total_d_loss / len(train_dataloader), total_q_loss / len(train_dataloader)
 
+def stage2_train(generator, discriminator, train_dataloader, optimizer, epoch, device, args, accelerator):
+    """
+    Stage 2 Training: Optimize RL-weighting agent (fix encoder/decoder).
+    
+    Args:
+        generator: the full model (encoder + decoder + rl_agent)
+        discriminator: not used in Stage 2 (optional)
+        train_dataloader: training data loader
+        optimizers: [optimizer_RL]
+        epoch: current epoch number
+        device: device
+        args: training args
+        accelerator: HuggingFace accelerator
+    Returns:
+        train_rl_loss: total loss for the RL agent (typically derived from task loss)
+    """
+    logger = logging.getLogger('training')
+    generator.train()
+    discriminator.eval()
+
+    optimizer_W = optimizer
+
+    if accelerator.is_main_process:
+        progress_bar = tqdm(
+            total=len(train_dataloader),
+            desc=f"Training Epoch {epoch}",
+            position=0,
+            leave=True,
+            file=sys.stdout
+        )
+
+    total_weight_loss = 0.0
+
+    for batch_idx, batch in enumerate(train_dataloader):
+        optimizer_W.zero_grad()
+
+        with autocast():
+            # Forward pass with stage=2 triggers weighting logic
+            outputs = generator(batch['image'], batch['question'], stage=2)
+            generated_images = outputs['generated_images']
+            generated_images = torch.clamp(generated_images, 0, 1)
+
+            # Compute the critic (discriminator) score on fake images
+            fake_score = discriminator(generated_images)
+            # WGAN generator loss: maximize fake_score, so minimize negative score
+            g_loss_adv = -fake_score.mean()
+            
+            # Total generator loss: include reconstruction, VGG, adversarial (WGAN) and feature matching losses
+            weight_loss = (
+                args.loss_recon * outputs['loss_recon'] +
+                args.loss_vgg   * outputs['loss_vgg'] +
+                args.loss_gen   * g_loss_adv +
+                args.loss_quant * outputs['quantization_loss'] 
+            )
+        accelerator.backward(weight_loss)
+
+        torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
+        optimizer_W.step()
+
+        total_weight_loss += weight_loss.item()
+
+        if accelerator.is_main_process:
+            progress_bar.set_postfix({"Weight_Loss": f"{weight_loss.item():.4f}"})
+            progress_bar.update(1)
+        
+        # Log batch statistics only on main process
+        if accelerator.is_main_process and batch_idx % args.log_interval == 0:
+            with torch.no_grad():
+                visualize_batch(
+                    batch['image'][0],
+                    outputs['generated_images'],
+                    batch['question'][0],
+                    batch['answer_text'][0],
+                    epoch,
+                    batch_idx,
+                    args,
+                    mode='train'
+                )
+                torch.cuda.empty_cache()
+        
+        # Synchronize after batch processing
+        accelerator.wait_for_everyone()
+
+        if accelerator.is_main_process and batch_idx % args.log_interval == 0:
+            logger.debug("[Weight] Batch %d - Loss: %.4f", batch_idx, weight_loss.item())
+
+        accelerator.wait_for_everyone()
+
+    return total_weight_loss / len(train_dataloader)
+
+
 def validate(generator, val_loader, epoch, device, args, accelerator):
     """Validate the model"""
     total_loss = 0
@@ -517,6 +608,15 @@ def main(args):
         betas=(0.5, 0.999)
     )
 
+    # Create optimizer for RL_weight_agent only
+    rl_agent_params = [p for n, p in generator.named_parameters() if 'RL_weight_agent' in n and p.requires_grad]
+    optimizer_W = torch.optim.Adam(
+        rl_agent_params,
+        lr=args.learning_rate_rl,
+        betas=(0.5, 0.999)
+    )
+            
+
     # Create cosine annealing scheduler with warmup
     warmup_epochs = 5
     def lr_lambda(epoch):
@@ -530,6 +630,7 @@ def main(args):
     
     scheduler_G = torch.optim.lr_scheduler.LambdaLR(optimizer_G, lr_lambda)
     scheduler_D = torch.optim.lr_scheduler.LambdaLR(optimizer_D, lr_lambda)
+    scheduler_W = torch.optim.lr_scheduler.LambdaLR(optimizer_W, lr_lambda)
 
     # Load checkpoint if it exists
     start_epoch = args.start_epoch
@@ -546,9 +647,10 @@ def main(args):
     train_dataloader, val_dataloader = create_vqa_dataloaders(args)
     
     # Let accelerator handle distribution
-    generator, optimizer_G, train_dataloader, val_dataloader = accelerator.prepare(
-        generator, optimizer_G, train_dataloader, val_dataloader
+    generator, optimizer_G, optimizer_W, train_dataloader, val_dataloader = accelerator.prepare(
+        generator, optimizer_G, optimizer_W, train_dataloader, val_dataloader
     )
+
     
     
     try:
@@ -620,53 +722,52 @@ def main(args):
         elif args.start_stage == 2:
             logger.info("Starting training stage 2: Semantic-aware HBF")
             for epoch in range(start_epoch, args.num_epochs_2):
-                generator.train()
-                train_g_loss, train_a_loss, train_d_loss, train_q_loss = stage2_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
-                
-                # Run validation every 5 epochs
-                generator.eval()
-                val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator)
-                logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Train A loss: {train_a_loss:.4f}, Train D loss: {train_d_loss:.4f}, Val loss: {val_loss:.4f}")
-                
-                scheduler_G.step()
-                scheduler_D.step()
-                
-                # Log learning rate
-                if accelerator.is_main_process:
-                    current_lr_G = optimizer_G.param_groups[0]['lr']
-                    current_lr_D = optimizer_D.param_groups[0]['lr']
-                    wandb.log({
-                        'epoch': epoch,
-                        'learning_rate_G': current_lr_G,
-                        'learning_rate_D': current_lr_D,
-                        'epoch_train_g_loss': train_g_loss,
-                        'epoch_train_a_loss': train_a_loss,
-                        'epoch_train_d_loss': train_d_loss,
-                        'epoch_train_q_loss': train_q_loss,
-                        'epoch_val_loss': val_loss,
-                    })
+                with autocast():
+                    generator.train()
+                    train_g_loss = stage2_train(generator, discriminator, train_dataloader, optimizer_W, epoch, device, args, accelerator)
+                        
+                        
+                    # Run validation every 5 epochs
+                    generator.eval()
+                    val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator)
+                    logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Val loss: {val_loss:.4f}")
                     
-                    # Save checkpoint asynchronously
-                    logger.info(f"Saving checkpoint with val_loss: {val_loss}")
-                    save_thread = threading.Thread(
-                        target=save_checkpoint,
-                        args=(
-                            generator.module if hasattr(generator, "module") else generator,
-                            epoch,
-                            val_loss,  # Make sure this is not None
-                            args
+                    scheduler_W.step()
+                    
+                    # Log learning rate
+                    if accelerator.is_main_process:
+                        current_lr_W = optimizer_W.param_groups[0]['lr']
+                        wandb.log({
+                            'epoch': epoch,
+                            'learning_rate_W': current_lr_W,
+                            'epoch_train_g_loss': train_g_loss,
+                            'epoch_val_loss': val_loss,
+                        })
+                        
+                        # Save checkpoint asynchronously
+                        logger.info(f"Saving checkpoint with val_loss: {val_loss}")
+                        save_thread = threading.Thread(
+                            target=save_checkpoint,
+                            args=(
+                                generator.module if hasattr(generator, "module") else generator,
+                                epoch,
+                                val_loss,  # Make sure this is not None
+                                args
+                            )
                         )
-                    )
-                    save_thread.start()
-                    
-                    # Wait for saving to complete before synchronization
-                    save_thread.join()
-                    logger.info(f"Rank 0: Checkpoint saving completed")
+                        save_thread.start()
+                        
+                        # Wait for saving to complete before synchronization
+                        save_thread.join()
+                        logger.info(f"Rank 0: Checkpoint saving completed")
 
-                
-                torch.cuda.empty_cache()
-                # All processes wait here once per epoch with longer timeout
-                accelerator.wait_for_everyone()
+                    
+                    torch.cuda.empty_cache()  # Clear memory before synchronization
+                    
+                    # All processes wait here once per epoch with longer timeout
+                    accelerator.wait_for_everyone() 
+
+
         elif args.start_stage == 3:
             logger.info("Starting training stage 3: Full fine-tuning")
             for epoch in range(start_epoch, args.num_epochs):

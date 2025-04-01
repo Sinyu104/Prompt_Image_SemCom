@@ -555,8 +555,7 @@ def main(args):
         # Training loop
         if args.start_stage == 1:
             logger.info("Starting training stage 1: Encoder-Decoder")
-            # num_epochs_phase_1 = args.num_epochs_1/2
-            num_epochs_phase_1 = 0
+            num_epochs_phase_1 = args.num_epochs_1/2
 
             for epoch in range(start_epoch, args.num_epochs_1):
                 if args.start_epoch == start_epoch:

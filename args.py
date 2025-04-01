@@ -19,10 +19,16 @@ def parse_args():
                        help="Initial learning rate for discriminator")
     parser.add_argument("--weight_decay", type=float, default=0.01,
                        help="Weight decay for AdamW")
-    parser.add_argument("--num_epochs", type=int, default=10,
-                       help="Number of training epochs")
+    parser.add_argument("--num_epochs_1", type=int, default=10,
+                       help="Number of training epochs for stage 1")
+    parser.add_argument("--num_epochs_2", type=int, default=10,
+                       help="Number of training epochs for stage 1")
+    parser.add_argument("--num_epochs_3", type=int, default=10,
+                       help="Number of training epochs for stage 1")
     parser.add_argument("--start_epoch", type=int, default=0,
                        help="Starting epoch number (useful for resuming training)")
+    parser.add_argument("--start_stage", type=int, choices=[1, 2, 3], default=1,
+                       help="Starting training stage: 1 (encoder-decoder), 2 (semantic-aware HBF), 3 (full fine-tuning)")
     
     # Dataset and model arguments
     parser.add_argument("--batch_size", type=int, default=32)

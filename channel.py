@@ -87,7 +87,7 @@ class GeometryBasedChannel(nn.Module):
 
         # Add complex AWGN
         noise = (torch.randn_like(Y) + 1j * torch.randn_like(Y)) * math.sqrt(self.noise_power / 2)
-        return Y   # [K, Nr]
+        return Y+noise   # [K, Nr]
 
     
 class MAryModulation(nn.Module):

@@ -180,7 +180,7 @@ def feature_matching_loss(discriminator, real_images, fake_images, loss_fn=F.l1_
         fm_loss += loss_fn(fake_feat, real_feat)
     return fm_loss
 
-def train_epoch(generator, discriminator, train_dataloader, optimizer, epoch, device, args, accelerator):
+def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, device, args, accelerator):
     """Train for one epoch with separate generator and discriminator steps"""
     # torch.autograd.set_detect_anomaly(True)  # Enable anomaly detection
     
@@ -484,59 +484,164 @@ def main(args):
     
     try:
         # Training loop
-        for epoch in range(start_epoch, args.num_epochs):
-        
-            with autocast():
+        if args.start_stage == 1:
+            logger.info("Starting training stage 1: Encoder-Decoder")
+            for epoch in range(start_epoch, args.num_epochs_1):
+            
+                with autocast():
+                    generator.train()
+                    train_g_loss, train_a_loss, train_d_loss, train_q_loss = stage1_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
+                
+                
+                # Run validation every 5 epochs
+                generator.eval()
+                val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator)
+                logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Train A loss: {train_a_loss:.4f}, Train D loss: {train_d_loss:.4f}, Val loss: {val_loss:.4f}")
+                
+                scheduler_G.step()
+                scheduler_D.step()
+                
+                # Log learning rate
+                if accelerator.is_main_process:
+                    current_lr_G = optimizer_G.param_groups[0]['lr']
+                    current_lr_D = optimizer_D.param_groups[0]['lr']
+                    wandb.log({
+                        'epoch': epoch,
+                        'learning_rate_G': current_lr_G,
+                        'learning_rate_D': current_lr_D,
+                        'epoch_train_g_loss': train_g_loss,
+                        'epoch_train_a_loss': train_a_loss,
+                        'epoch_train_d_loss': train_d_loss,
+                        'epoch_train_q_loss': train_q_loss,
+                        'epoch_val_loss': val_loss,
+                    })
+                    
+                    # Save checkpoint asynchronously
+                    logger.info(f"Saving checkpoint with val_loss: {val_loss}")
+                    save_thread = threading.Thread(
+                        target=save_checkpoint,
+                        args=(
+                            generator.module if hasattr(generator, "module") else generator,
+                            epoch,
+                            val_loss,  # Make sure this is not None
+                            args
+                        )
+                    )
+                    save_thread.start()
+                    
+                    # Wait for saving to complete before synchronization
+                    save_thread.join()
+                    logger.info(f"Rank 0: Checkpoint saving completed")
+
+                
+                torch.cuda.empty_cache()  # Clear memory before synchronization
+                
+                # All processes wait here once per epoch with longer timeout
+                accelerator.wait_for_everyone() 
+        elif args.start_stage == 2:
+            logger.info("Starting training stage 2: Semantic-aware HBF")
+            for epoch in range(start_epoch, args.num_epochs):
+                generator.train()
+                train_g_loss, train_a_loss, train_d_loss, train_q_loss = stage2_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
+                
+                # Run validation every 5 epochs
+                generator.eval()
+                val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator)
+                logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Train A loss: {train_a_loss:.4f}, Train D loss: {train_d_loss:.4f}, Val loss: {val_loss:.4f}")
+                
+                scheduler_G.step()
+                scheduler_D.step()
+                
+                # Log learning rate
+                if accelerator.is_main_process:
+                    current_lr_G = optimizer_G.param_groups[0]['lr']
+                    current_lr_D = optimizer_D.param_groups[0]['lr']
+                    wandb.log({
+                        'epoch': epoch,
+                        'learning_rate_G': current_lr_G,
+                        'learning_rate_D': current_lr_D,
+                        'epoch_train_g_loss': train_g_loss,
+                        'epoch_train_a_loss': train_a_loss,
+                        'epoch_train_d_loss': train_d_loss,
+                        'epoch_train_q_loss': train_q_loss,
+                        'epoch_val_loss': val_loss,
+                    })
+                    
+                    # Save checkpoint asynchronously
+                    logger.info(f"Saving checkpoint with val_loss: {val_loss}")
+                    save_thread = threading.Thread(
+                        target=save_checkpoint,
+                        args=(
+                            generator.module if hasattr(generator, "module") else generator,
+                            epoch,
+                            val_loss,  # Make sure this is not None
+                            args
+                        )
+                    )
+                    save_thread.start()
+                    
+                    # Wait for saving to complete before synchronization
+                    save_thread.join()
+                    logger.info(f"Rank 0: Checkpoint saving completed")
+
+                
+                torch.cuda.empty_cache()
+                # All processes wait here once per epoch with longer timeout
+                accelerator.wait_for_everyone()
+        elif args.start_stage == 3:
+            logger.info("Starting training stage 3: Full fine-tuning")
+            for epoch in range(start_epoch, args.num_epochs):
                 generator.train()
                 train_g_loss, train_a_loss, train_d_loss, train_q_loss = train_epoch(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
-            
-            
-            # Run validation every 5 epochs
-            generator.eval()
-            val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator)
-            logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Train A loss: {train_a_loss:.4f}, Train D loss: {train_d_loss:.4f}, Val loss: {val_loss:.4f}")
-            
-            scheduler_G.step()
-            scheduler_D.step()
-            
-            # Log learning rate
-            if accelerator.is_main_process:
-                current_lr_G = optimizer_G.param_groups[0]['lr']
-                current_lr_D = optimizer_D.param_groups[0]['lr']
-                wandb.log({
-                    'epoch': epoch,
-                    'learning_rate_G': current_lr_G,
-                    'learning_rate_D': current_lr_D,
-                    'epoch_train_g_loss': train_g_loss,
-                    'epoch_train_a_loss': train_a_loss,
-                    'epoch_train_d_loss': train_d_loss,
-                    'epoch_train_q_loss': train_q_loss,
-                    'epoch_val_loss': val_loss,
-                })
                 
-                # Save checkpoint asynchronously
-                logger.info(f"Saving checkpoint with val_loss: {val_loss}")
-                save_thread = threading.Thread(
-                    target=save_checkpoint,
-                    args=(
-                        generator.module if hasattr(generator, "module") else generator,
-                        epoch,
-                        val_loss,  # Make sure this is not None
-                        args
+                # Run validation every 5 epochs
+                generator.eval()
+                val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator)
+                logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Train A loss: {train_a_loss:.4f}, Train D loss: {train_d_loss:.4f}, Val loss: {val_loss:.4f}")
+                
+                scheduler_G.step()
+                scheduler_D.step()
+                
+                # Log learning rate
+                if accelerator.is_main_process:
+                    current_lr_G = optimizer_G.param_groups[0]['lr']
+                    current_lr_D = optimizer_D.param_groups[0]['lr']
+                    wandb.log({
+                        'epoch': epoch,
+                        'learning_rate_G': current_lr_G,
+                        'learning_rate_D': current_lr_D,
+                        'epoch_train_g_loss': train_g_loss,
+                        'epoch_train_a_loss': train_a_loss,
+                        'epoch_train_d_loss': train_d_loss,
+                        'epoch_train_q_loss': train_q_loss,
+                        'epoch_val_loss': val_loss,
+                    })
+                    
+                    # Save checkpoint asynchronously
+                    logger.info(f"Saving checkpoint with val_loss: {val_loss}")
+                    save_thread = threading.Thread(
+                        target=save_checkpoint,
+                        args=(
+                            generator.module if hasattr(generator, "module") else generator,
+                            epoch,
+                            val_loss,  # Make sure this is not None
+                            args
+                        )
                     )
-                )
-                save_thread.start()
-                
-                # Wait for saving to complete before synchronization
-                save_thread.join()
-                logger.info(f"Rank 0: Checkpoint saving completed")
+                    save_thread.start()
+                    
+                    # Wait for saving to complete before synchronization
+                    save_thread.join()
+                    logger.info(f"Rank 0: Checkpoint saving completed")
 
-            
-            torch.cuda.empty_cache()  # Clear memory before synchronization
-            
-            # All processes wait here once per epoch with longer timeout
-            accelerator.wait_for_everyone() 
-            
+                
+                torch.cuda.empty_cache()
+                # All processes wait here once per epoch with longer timeout
+                accelerator.wait_for_everyone()
+        else:
+            logger.info("Training stage not specified. Exiting.")
+
+                
             
     except Exception as e:
         print(f"Training error: {str(e)}")

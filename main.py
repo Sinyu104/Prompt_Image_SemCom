@@ -180,17 +180,13 @@ def feature_matching_loss(discriminator, real_images, fake_images, loss_fn=F.l1_
         fm_loss += loss_fn(fake_feat, real_feat)
     return fm_loss
 
-def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, device, args, accelerator):
+def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, device, args, accelerator, phase=1):
     """Train for one epoch with separate generator and discriminator steps"""
     # torch.autograd.set_detect_anomaly(True)  # Enable anomaly detection
     
     logger = logging.getLogger('training')
     generator.train()
-    total_g_loss = 0
-    total_d_loss = 0
-    total_a_loss = 0
-    total_q_loss = 0
-    lambda_gp = 10.0
+    
 
     optimizer_G, optimizer_D = optimizer  # Unpack optimizers
 
@@ -205,97 +201,170 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
         )
    
     try:
-        for batch_idx, batch in enumerate(train_dataloader):
-            
-            # Train Discriminator only on even batch indices
-            optimizer_G.zero_grad()
-            with autocast():
-                outputs = generator(batch['image'], batch['question'])
-                generated_images = outputs['generated_images']
-                generated_images = torch.clamp(generated_images, 0, 1)
-    
-                # Compute the critic (discriminator) score on fake images
-                # fake_score = discriminator(generated_images)
-                # WGAN generator loss: maximize fake_score, so minimize negative score
-                # g_loss_adv = -fake_score.mean()
-                
-                # Feature matching loss from discriminator intermediate features
-                # fm_loss = feature_matching_loss(discriminator, batch['image'], generated_images)
-                
-                # Total generator loss: include reconstruction, VGG, adversarial (WGAN) and feature matching losses
-                g_loss = (
-                    args.loss_recon * outputs['loss_recon'] +
-                    args.loss_vgg   * outputs['loss_vgg'] +
-                    args.loss_quant * outputs['quantization_loss'] 
-                )
-            accelerator.backward(g_loss)
-            
-            # Clip gradients for generator
-            torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
-            optimizer_G.step()
-
-            # if batch_idx % args.discriminator_update_freq == 0:
-            #     optimizer_D.zero_grad()
-            #     with autocast():
-            #         # Compute scores on real and fake images
-            #         real_score = discriminator(batch['image'])
-            #         fake_score = discriminator(generated_images.detach())
-            #         # WGAN discriminator loss: maximize (real_score - fake_score), so minimize negative of that
-            #         d_loss_adv = -(real_score.mean() - fake_score.mean())
-                    
-            #         # Compute gradient penalty
-            #         gp = gradient_penalty(discriminator, batch['image'], generated_images.detach(), device, lambda_gp=lambda_gp)
-                    
-            #         logger.debug(f"Gradient penalty: {gp}, Discriminator loss: {d_loss_adv}")
-                    
-            #         # Total discriminator loss: adversarial loss + weighted gradient penalty
-            #         d_loss = d_loss_adv + lambda_gp * gp
-                    
-            #     accelerator.backward(d_loss)
-            #     # Clip gradients for discriminator
-            #     torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
-            #     optimizer_D.step()
-
-            total_g_loss += g_loss.item()  # Track generator loss
-            # total_a_loss += g_loss_adv.item()  # Track VGG loss
-            # total_d_loss += d_loss.item()  # Track discriminator loss
-            total_q_loss += outputs['quantization_loss'].item()  # Track quantization loss
-            
-            # Update progress bar on main process
-            if accelerator.is_main_process:
-                progress_bar.set_postfix({
-                    "G_loss": f"{g_loss.item():.4f}",
-                    # "D_loss": f"{d_loss.item():.4f}"
-                })
-                progress_bar.update(1)
-            
-            # Log batch statistics only on main process
-            if accelerator.is_main_process and batch_idx % args.log_interval == 0:
-                with torch.no_grad():
-                    visualize_batch(
-                        batch['image'][0],
-                        outputs['generated_images'],
-                        batch['question'][0],
-                        batch['answer_text'][0],
-                        epoch,
-                        batch_idx,
-                        args,
-                        mode='train'
+        if phase == 1:
+            total_g_loss = 0
+            total_q_loss = 0
+            for batch_idx, batch in enumerate(train_dataloader):
+                # Train Discriminator only on even batch indices
+                optimizer_G.zero_grad()
+                with autocast():
+                    outputs = generator(batch['image'], batch['question'], stage=1)
+                    generated_images = outputs['generated_images']
+                    generated_images = torch.clamp(generated_images, 0, 1)
+        
+                    g_loss = (
+                        args.loss_recon * outputs['loss_recon'] +
+                        args.loss_vgg   * outputs['loss_vgg'] +
+                        args.loss_quant * outputs['quantization_loss'] 
                     )
-                    torch.cuda.empty_cache()
+                accelerator.backward(g_loss)
+                
+                # Clip gradients for generator
+                torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
+                optimizer_G.step()
+
+
+                total_g_loss += g_loss.item()  # Track generator loss
+                total_q_loss += outputs['quantization_loss'].item()  # Track quantization loss
+                
+                # Update progress bar on main process
+                if accelerator.is_main_process:
+                    progress_bar.set_postfix({
+                        "G_loss": f"{g_loss.item():.4f}"
+                    })
+                    progress_bar.update(1)
+                
+                # Log batch statistics only on main process
+                if accelerator.is_main_process and batch_idx % args.log_interval == 0:
+                    with torch.no_grad():
+                        visualize_batch(
+                            batch['image'][0],
+                            outputs['generated_images'],
+                            batch['question'][0],
+                            batch['answer_text'][0],
+                            epoch,
+                            batch_idx,
+                            args,
+                            mode='train'
+                        )
+                        torch.cuda.empty_cache()
+                
+                
+                # Synchronize after batch processing
+                accelerator.wait_for_everyone()
+                
+                if accelerator.is_main_process and batch_idx % args.log_interval == 0:
+                    logger.debug(
+                        "Batch %d stats - Loss components: recon=%.4f, perc=%.4f, vgg=%.4f",
+                        batch_idx,
+                        outputs["loss_recon"],
+                        outputs["loss_perc"],
+                        outputs["loss_vgg"],
+                    )  
+
+        elif phase ==2:
+            total_g_loss = 0
+            total_d_loss = 0
+            total_a_loss = 0
+            total_q_loss = 0
+            lambda_gp = 10.0
+            for batch_idx, batch in enumerate(train_dataloader):
             
-            
-            # Synchronize after batch processing
-            accelerator.wait_for_everyone()
-            
-            if accelerator.is_main_process and batch_idx % args.log_interval == 0:
-                logger.debug(
-                    "Batch %d stats - Loss components: recon=%.4f, perc=%.4f, vgg=%.4f",
-                    batch_idx,
-                    outputs["loss_recon"],
-                    outputs["loss_perc"],
-                    outputs["loss_vgg"],
-                )  
+                # Train Discriminator only on even batch indices
+                optimizer_G.zero_grad()
+                with autocast():
+                    outputs = generator(batch['image'], batch['question'], stage=1)
+                    generated_images = outputs['generated_images']
+                    generated_images = torch.clamp(generated_images, 0, 1)
+        
+                    # Compute the critic (discriminator) score on fake images
+                    fake_score = discriminator(generated_images)
+                    # WGAN generator loss: maximize fake_score, so minimize negative score
+                    g_loss_adv = -fake_score.mean()
+                    
+                    # Feature matching loss from discriminator intermediate features
+                    # fm_loss = feature_matching_loss(discriminator, batch['image'], generated_images)
+                    
+                    # Total generator loss: include reconstruction, VGG, adversarial (WGAN) and feature matching losses
+                    g_loss = (
+                        args.loss_recon * outputs['loss_recon'] +
+                        args.loss_vgg   * outputs['loss_vgg'] +
+                        args.loss_gen   * g_loss_adv +
+                        args.loss_quant * outputs['quantization_loss'] 
+                    )
+                accelerator.backward(g_loss)
+                
+                # Clip gradients for generator
+                torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
+                optimizer_G.step()
+
+                if batch_idx % args.discriminator_update_freq == 0:
+                    optimizer_D.zero_grad()
+                    with autocast():
+                        # Compute scores on real and fake images
+                        real_score = discriminator(batch['image'])
+                        fake_score = discriminator(generated_images.detach())
+                        # WGAN discriminator loss: maximize (real_score - fake_score), so minimize negative of that
+                        d_loss_adv = -(real_score.mean() - fake_score.mean())
+                        
+                        # Compute gradient penalty
+                        gp = gradient_penalty(discriminator, batch['image'], generated_images.detach(), device, lambda_gp=lambda_gp)
+                        
+                        logger.debug(f"Gradient penalty: {gp}, Discriminator loss: {d_loss_adv}")
+                        
+                        # Total discriminator loss: adversarial loss + weighted gradient penalty
+                        d_loss = d_loss_adv + lambda_gp * gp
+                        
+                    accelerator.backward(d_loss)
+                    # Clip gradients for discriminator
+                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+                    optimizer_D.step()
+
+                total_g_loss += g_loss.item()  # Track generator loss
+                total_a_loss += g_loss_adv.item()  # Track VGG loss
+                total_d_loss += d_loss.item()  # Track discriminator loss
+                total_q_loss += outputs['quantization_loss'].item()  # Track quantization loss
+                
+                # Update progress bar on main process
+                if accelerator.is_main_process:
+                    progress_bar.set_postfix({
+                        "G_loss": f"{g_loss.item():.4f}",
+                        "D_loss": f"{d_loss.item():.4f}"
+                    })
+                    progress_bar.update(1)
+                
+                # Log batch statistics only on main process
+                if accelerator.is_main_process and batch_idx % args.log_interval == 0:
+                    with torch.no_grad():
+                        visualize_batch(
+                            batch['image'][0],
+                            outputs['generated_images'],
+                            batch['question'][0],
+                            batch['answer_text'][0],
+                            epoch,
+                            batch_idx,
+                            args,
+                            mode='train'
+                        )
+                        torch.cuda.empty_cache()
+                
+                
+                # Synchronize after batch processing
+                accelerator.wait_for_everyone()
+                
+                if accelerator.is_main_process and batch_idx % args.log_interval == 0:
+                    logger.debug(
+                        "Batch %d stats - Loss components: recon=%.4f, perc=%.4f, vgg=%.4f, adv=%.4f, gp=%.4f",
+                        batch_idx,
+                        outputs["loss_recon"],
+                        outputs["loss_perc"],
+                        outputs["loss_vgg"],
+                        g_loss_adv.item(),
+                        gp.item(),
+                    )  
+        else:
+            Exception("Invalid stage for training")
+        
         
     except Exception as e:
         print(f"Error in train_epoch: {str(e)}")
@@ -486,13 +555,24 @@ def main(args):
         # Training loop
         if args.start_stage == 1:
             logger.info("Starting training stage 1: Encoder-Decoder")
+            # num_epochs_phase_1 = args.num_epochs_1/2
+            num_epochs_phase_1 = 0
+
             for epoch in range(start_epoch, args.num_epochs_1):
-            
+                if args.start_epoch == start_epoch:
+                    logger.info("Starting training in phase I")
+                elif args.start_epoch == num_epochs_phase_1:
+                    logger.info("Starting training in phase II")
+                else:
+                    pass
                 with autocast():
                     generator.train()
-                    train_g_loss, train_a_loss, train_d_loss, train_q_loss = stage1_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
-                
-                
+                    if epoch < num_epochs_phase_1/2:
+                        train_g_loss, train_a_loss, train_d_loss, train_q_loss = stage1_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator, phase=1)
+                    else:
+                        train_g_loss, train_a_loss, train_d_loss, train_q_loss = stage1_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator, phase=2)
+                    
+                    
                 # Run validation every 5 epochs
                 generator.eval()
                 val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator)
@@ -540,7 +620,7 @@ def main(args):
                 accelerator.wait_for_everyone() 
         elif args.start_stage == 2:
             logger.info("Starting training stage 2: Semantic-aware HBF")
-            for epoch in range(start_epoch, args.num_epochs):
+            for epoch in range(start_epoch, args.num_epochs_2):
                 generator.train()
                 train_g_loss, train_a_loss, train_d_loss, train_q_loss = stage2_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
                 

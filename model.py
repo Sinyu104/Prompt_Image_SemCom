@@ -1466,6 +1466,7 @@ class TextOrientedImageGeneration(nn.Module):
         output_hidden_states: Optional[bool] = None,
         interpolate_pos_encoding: bool = True,
         return_dict: Optional[bool] = None,
+        stage: Optional[int] = 0,
     ) -> Union[Tuple, CLIPSegOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1563,8 +1564,11 @@ class TextOrientedImageGeneration(nn.Module):
             transmitted_index = quantized_indices.detach()  # simulate transmission
             transmitted_indices.append(transmitted_index)
         
-
-        received = self.physical_layer(transmitted_indices)  #  [B, len, group] recovered indices
+        if stage == 1:
+            transmitted_indices = torch.stack(transmitted_indices, dim=0)
+            received = transmitted_indices
+        else:
+            received = self.physical_layer(transmitted_indices)  #  [B, len, group] recovered indices
         recovered_embedding = self.quantizer.recover_embeddings(received)
         
         # STE: replace hard recovered with soft quantized during backward
@@ -1830,7 +1834,7 @@ class VQAWithSegmentation(nn.Module):
         ])
         
         
-    def forward(self, images, questions):
+    def forward(self, images, questions, stage=None):
         # Process images and text separately
         image_inputs = self.processor.image_processor(
             images=images,
@@ -1854,7 +1858,7 @@ class VQAWithSegmentation(nn.Module):
         
         # Move all inputs to device
         inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-        outputs = self.image_generation_model(**inputs)
+        outputs = self.image_generation_model(**inputs, stage=stage)
         generated_images = outputs.logits  # Keep batch dimension
         quantization_loss = outputs.quantization_loss
         

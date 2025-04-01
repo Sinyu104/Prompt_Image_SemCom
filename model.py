@@ -40,7 +40,7 @@ from transformers import GenerationConfig
 import torchvision
 from torchvision import models
 import torch.nn.utils.spectral_norm as spectral_norm
-from channel import MAryModulation, PhysicalLayerModule
+from channel import PhysicalLayerModule
 
 
 logger = logging.get_logger(__name__)
@@ -1397,8 +1397,8 @@ class TextOrientedImageGeneration(nn.Module):
         self.reduces = nn.ModuleList(
             [nn.Linear(config.vision_config.hidden_size, config.reduce_dim) for _ in range(len(self.extract_layers))]
         )
-        self.mary_modulation = MAryModulation(M=8)
-        self.physical_modulation = PhysicalLayerModule(self.config.physical_config)
+
+        self.physical_layer = PhysicalLayerModule(self.config.physical_config, device=device)
 
         self.decoder = CLIPSegDecoder(config)
         
@@ -1564,39 +1564,12 @@ class TextOrientedImageGeneration(nn.Module):
             transmitted_indices.append(transmitted_index)
         
 
-        modulated = self.mary_modulation(transmitted_indices)  #  [L, B, len, group, 2] complex
-        received = self.mary_modulation.demodulate(modulated)  # [B, len, group] recovered indices
+        received = self.physical_layer(transmitted_indices)  #  [B, len, group] recovered indices
         recovered_embedding = self.quantizer.recover_embeddings(received)
         
         # STE: replace hard recovered with soft quantized during backward
-        quantized_activations = torch.cat(quantized_activations, dim=0)
+        quantized_activations = torch.stack(quantized_activations, dim=0)
         mixed_embedding = quantized_activations + (recovered_embedding - quantized_activations).detach()
-        
-        # mixed_embedding = quantized_activation
-        mixed_embedding = mixed_embedding.view(len(self.extract_layers), -1, mixed_embedding.shape[1], mixed_embedding.shape[2])
-        recovered_embedding = recovered_embedding.view(len(self.extract_layers), -1, recovered_embedding.shape[1], recovered_embedding.shape[2])
-        
-        # modulated_local_embeddings = []
-        # for emb in local_embeddings:
-        #     # emb shape: [B, seq_len, reduce_dim]
-        #     mod_emb, modulation_probs = self.mary_modulation(emb)
-        #     modulated_local_embeddings.append(mod_emb)
-        # # For example, we could combine the modulated embeddings (e.g. by averaging or concatenation)
-        # combined_modulated = torch.mean(torch.stack(modulated_local_embeddings, dim=0), dim=0)
-        # # Now, reshape the combined modulated embeddings to match the physical layer input.
-        # # For instance, assume we want a grid of shape [B, K, NS]:
-        # # (You may design this mapping based on your system parameters.)
-        # B = combined_modulated.shape[0]
-        # # Here we assume: total tokens = seq_len, and we choose K and NS such that K * NS equals that.
-        # K = self.config.num_subcarriers
-        # NS = self.config.NS  # symbols per subcarrier
-        # modulated_grid = combined_modulated.view(B, K, NS)
-        
-        # # === Step 5: Pass through the physical layer (hybrid beamforming) module ===
-        # transmitted_signal = self.physical_layer(modulated_grid)
-
-        # for embedding in local_embeddings:
-        #     recovered_embeddings.append(self.quantizer.recover_embeddings(embedding))
 
         # step 3: forward through decoder
         if self.training:

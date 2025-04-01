@@ -3,144 +3,91 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import torch
+import torch.nn as nn
+import math
+
 class GeometryBasedChannel(nn.Module):
-    def __init__(self, Nt, Nr, NC, NR):
-        """
-        Nt: number of transmit antennas
-        Nr: number of receive antennas
-        NC: number of clusters
-        NR: number of rays per cluster
-        """
-        super(GeometryBasedChannel, self).__init__()
+    def __init__(self, Nt, Nr, NC, NR, device, subcarriers=1, wavelength=2.0, noise_power=1e-3):
+        super().__init__()
         self.Nt = Nt
         self.Nr = Nr
         self.NC = NC
         self.NR = NR
+        self.K = subcarriers
+        self.wavelength = wavelength
+        self.noise_power = noise_power
 
-    def array_response_tx(self, theta):
-        # Transmit array steering vector (uniform linear array)
-        n = torch.arange(self.Nt, dtype=torch.float32, device=theta.device)
-        return (1/math.sqrt(self.Nt)) * torch.exp(1j * math.pi * n * torch.sin(theta))
+        self.total_paths = NC * NR
+        self.d = 0.5 * wavelength
 
-    def array_response_rx(self, theta):
-        # Receive array steering vector
-        n = torch.arange(self.Nr, dtype=torch.float32, device=theta.device)
-        return (1/math.sqrt(self.Nr)) * torch.exp(1j * math.pi * n * torch.sin(theta))
+        # Internal channel state
+        self.H = self._build_channel(device=device)  # to be updated with `update_channel`
 
-    def forward(self, k=0):
-        """
-        Generate channel matrix H for one subcarrier.
-        According to the paper:
-        H = sqrt(Nt*Nr/(NC*NR)) * sum_{c=1}^{NC} sum_{l=1}^{NR} α_{cl} a_r(θ_{r_{cl}}) a_t(θ_{t_{cl}})^H
-        """
-        H = 0.0
-        scaling = math.sqrt(self.Nt * self.Nr / (self.NC * self.NR))
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        for c in range(self.NC):
-            for l in range(self.NR):
-                # Complex gain: Rayleigh fading (zero mean, unit variance)
-                alpha = (torch.randn(1, device=device) + 1j * torch.randn(1, device=device)) / math.sqrt(2)
-                # Random departure/arrival angles (e.g., uniformly drawn in a certain range)
-                theta_t = (torch.rand(1, device=device) - 0.5) * math.pi/2  # from -pi/4 to pi/4
-                theta_r = (torch.rand(1, device=device) - 0.5) * math.pi/2
-                a_t = self.array_response_tx(theta_t)  # shape [Nt]
-                a_r = self.array_response_rx(theta_r)  # shape [Nr]
-                # Outer product gives a matrix of shape [Nr, Nt]
-                H += alpha * torch.ger(a_r, a_t.conj())
-        H = scaling * H
-        return H  # shape [Nr, Nt], complex
+        self.device = device
 
-#####################################
-# 2. Hybrid Precoder Module         #
-#####################################
-class HybridPrecoderModule(nn.Module):
-    def __init__(self, Nt, NRF, Ns):
-        """
-        Nt: number of transmit antennas
-        NRF: number of RF chains (analog precoder dimension)
-        Ns: number of data streams (digital precoder output dimension)
-        """
-        super(HybridPrecoderModule, self).__init__()
-        self.Nt = Nt
-        self.NRF = NRF
-        self.Ns = Ns
+    def array_response(self, N, phi):
+        n = torch.arange(N, dtype=torch.float32, device=phi.device).view(-1, 1)
+        phase_shifts = 2 * math.pi * self.d * torch.sin(phi) / self.wavelength
+        return (1 / math.sqrt(N)) * torch.exp(1j * n * phase_shifts)
 
-        # Analog precoder: parameterize by phases to satisfy |[VA]ij|=1.
-        # We will store learnable phases of shape [Nt, NRF].
-        self.analog_phases = nn.Parameter(torch.rand(Nt, NRF) * 2 * math.pi)
-        # Digital precoder: a learnable linear mapping from NRF to Ns.
-        self.digital_precoder = nn.Linear(NRF, Ns, bias=False)
+    def _build_channel(self, device):
 
-    def forward(self, S):
-        """
-        S: input symbol vector, shape [B, Ns] (assume complex tensor)
-        Returns: transmitted signal X [B, Nt] and combined precoder V [Nt, Ns]
-        """
-        # Construct analog precoder VA: exp(j*phase)
-        VA = torch.exp(1j * self.analog_phases)  # shape [Nt, NRF]
-        # Get digital precoder weight (note: weight shape is [Ns, NRF])
-        # We want a digital matrix VD of shape [NRF, Ns].
-        VD = self.digital_precoder.weight.transpose(0, 1)  # shape [NRF, Ns]
-        # Combined precoder: V = VA * VD, shape [Nt, Ns]
-        V = torch.matmul(VA, VD)
-        # Transmit: X = V * s (for each sample, s has shape [Ns])
-        X = torch.matmul(S, V.transpose(0, 1))  # [B, Nt]
-        return X, V
+        if device is None:
+            device = self.device if hasattr(self, "device") else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-#####################################
-# 3. Hybrid Combiner Module         #
-#####################################
-class HybridCombinerModule(nn.Module):
-    def __init__(self, Nr, NRF, Ns):
-        """
-        Nr: number of receive antennas
-        NRF: number of RF chains at receiver
-        Ns: number of data streams (digital combiner output dimension)
-        """
-        super(HybridCombinerModule, self).__init__()
-        self.Nr = Nr
-        self.NRF = NRF
-        self.Ns = Ns
+        P = self.total_paths
+        K = self.K
+        H_all = []
 
-        # Analog combiner: learnable phases
-        self.analog_phases = nn.Parameter(torch.rand(Nr, NRF) * 2 * math.pi)
-        # Digital combiner: learnable linear mapping from NRF to Ns
-        self.digital_combiner = nn.Linear(NRF, Ns, bias=False)
+        alpha = (torch.randn(P, device=device) + 1j * torch.randn(P, device=device)) / math.sqrt(2)
+        psi = torch.rand(self.NC, device=device)
+        psi_full = psi.repeat_interleave(self.NR)
 
-    def forward(self, Y):
-        """
-        Y: received signal, shape [B, Nr]
-        Returns: combined output s_hat, and overall combiner Q
-        """
-        QA = torch.exp(1j * self.analog_phases)  # [Nr, NRF]
-        QD = self.digital_combiner.weight.transpose(0, 1)  # [NRF, Ns]
-        Q = torch.matmul(QA, QD)  # overall combiner, shape [Nr, Ns]
-        # Apply combiner: s_hat = Q^H Y^T, then transpose back
-        s_hat = torch.matmul(Y, Q)  # [B, Ns]
-        return s_hat, Q
+        phi_t = (torch.rand(P, device=device) - 0.5) * math.pi
+        phi_r = (torch.rand(P, device=device) - 0.5) * math.pi
 
-#####################################
-# 4. Hybrid Beamforming Module      #
-#####################################
-class HybridBeamformingModule(nn.Module):
-    def __init__(self, Nt, Nr, NRF, Ns):
-        super(HybridBeamformingModule, self).__init__()
-        self.precoder = HybridPrecoderModule(Nt, NRF, Ns)
-        self.combiner = HybridCombinerModule(Nr, NRF, Ns)
+        A_t = self.array_response(self.Nt, phi_t)
+        A_r = self.array_response(self.Nr, phi_r)
 
-    def forward(self, S, H):
+        H_b = []
+        for k in range(K):
+            theta_k = 2 * math.pi * psi_full * k / K
+            alpha_k = alpha * torch.exp(-1j * theta_k)
+            H_k = A_r @ torch.diag(alpha_k) @ A_t.conj().transpose(0, 1)
+            scaling = math.sqrt(self.Nt * self.Nr / P)
+            H_b.append(scaling * H_k)
+        H_all.append(torch.stack(H_b, dim=0))  # [K, Nr, Nt]
+
+        return torch.stack(H_all, dim=0)  # [K, Nr, Nt]
+    def get_channel(self):
         """
-        S: transmitted symbols, shape [B, Ns] (complex tensor)
-        H: channel matrix, shape [Nr, Nt] (complex tensor)
+        Get the current channel realization.
         """
-        # Transmitter: apply precoder
-        X, V = self.precoder(S)  # X: [B, Nt]
-        # Channel: simulate transmission: Y = H * X for each sample.
-        # Assume H is same for the batch (or use batch channel if available)
-        Y = torch.matmul(H, X.transpose(0,1)).transpose(0,1)  # [B, Nr]
-        # Receiver: apply combiner
-        s_hat, Q = self.combiner(Y)  # [B, Ns]
-        return s_hat, V, Q
+        return self.H
+
+    def update_channel(self):
+        """
+        Regenerate a new channel realization and store it in self.H.
+        """
+        self.H = self._build_channel(device=self.device)  # [K, Nr, Nt]
+
+    def forward(self, X):
+        """
+        Apply channel to transmitted signal.
+        Args:
+            X: [K, Nt] complex64 → transmitted signal per subcarrier
+        Returns:
+            Y: [K, Nr] → received signal
+        """
+        K, Nt, _ = X.shape
+        assert K == self.K and Nt == self.Nt
+
+        Y = torch.matmul(self.H, X).squeeze(-1)  # [K, Nr]
+
+        # Add complex AWGN
+        noise = (torch.randn_like(Y) + 1j * torch.randn_like(Y)) * math.sqrt(self.noise_power / 2)
+        return Y   # [K, Nr]
 
     
 class MAryModulation(nn.Module):
@@ -154,7 +101,7 @@ class MAryModulation(nn.Module):
         self.M = M
         self.bits_per_symbol = int(math.log2(M))
         self.constellation = self._generate_constellation(M)  # [M], complex dtype
-        print("constellation: ", self.constellation)
+        
 
     def _generate_constellation(self, M):
         """
@@ -165,7 +112,7 @@ class MAryModulation(nn.Module):
         constellation = torch.exp(1j * angles)
         return constellation  # [M]
 
-    def forward(self, x):
+    def modulate(self, x):
         """
         Args:
             x: Long tensor of shape [len], values in [0, 63]
@@ -173,9 +120,11 @@ class MAryModulation(nn.Module):
             modulated: [len, 2], each entry is complex number (2 symbols per input)
         """
         if isinstance(x, list):
-            x = torch.cat(x, dim=0)
+            L = len(x)
+            B = x[0].shape[0]
+            x = torch.cat(x, dim=0)  # [L * B, len, group]
         assert x.dtype == torch.long and x.max() < 64
-        shape = x.shape  # [B, len, group]
+        LB, length, group = x.shape # [B, len, group]
         flat_x = x.view(-1)  # [B * len * group]
 
         # Convert each value to 6-bit binary
@@ -192,7 +141,7 @@ class MAryModulation(nn.Module):
         ], dim=-1)  # [N, 2]
 
         # Reshape back to [B, len, group, 2]
-        return modulated.view(*shape, 2)  # complex tensor
+        return modulated.view(L, B, length, group, 2)  # complex tensor
 
     def demodulate(self, modulated):
         """
@@ -223,62 +172,6 @@ def constant_modulus(matrix):
     # Given a complex matrix, project it to have unit modulus on every entry.
     return torch.exp(1j * torch.angle(matrix))
 
-##########################################
-# 1. Hybrid Precoder/Combiner Modules
-##########################################
-class HybridPrecoderModule(nn.Module):
-    def __init__(self, Nt, NRF, Ns):
-        """
-        Nt: number of transmit antennas
-        NRF: number of RF chains (analog precoder dimension)
-        Ns: number of data streams (digital precoder output dimension)
-        """
-        super(HybridPrecoderModule, self).__init__()
-        self.Nt = Nt
-        self.NRF = NRF
-        self.Ns = Ns
-
-        # Instead of storing the full complex matrix, we parameterize
-        # the analog precoder via real-valued phases.
-        self.analog_phases = nn.Parameter(torch.rand(Nt, NRF) * 2 * math.pi)
-        # Digital precoder: unconstrained complex matrix (learned via closed‐form update)
-        # We initialize it randomly.
-        self.digital_precoder = nn.Parameter(torch.randn(NRF, Ns, dtype=torch.cfloat))
-
-    def get_analog_precoder(self):
-        # Construct the analog precoder from phases:
-        return torch.exp(1j * self.analog_phases)  # shape: [Nt, NRF]
-
-    def forward(self, digital_input=None):
-        # For our optimization routine, the module output is just the overall precoder:
-        VA = self.get_analog_precoder()  # [Nt, NRF]
-        VD = self.digital_precoder         # [NRF, Ns]
-        V = torch.matmul(VA, VD)            # Overall precoder: [Nt, Ns]
-        return V, VA, VD
-
-class HybridCombinerModule(nn.Module):
-    def __init__(self, Nr, NRF, Ns):
-        """
-        Nr: number of receive antennas
-        NRF: number of RF chains at receiver
-        Ns: number of data streams (digital combiner output dimension)
-        """
-        super(HybridCombinerModule, self).__init__()
-        self.Nr = Nr
-        self.NRF = NRF
-        self.Ns = Ns
-
-        self.analog_phases = nn.Parameter(torch.rand(Nr, NRF) * 2 * math.pi)
-        self.digital_combiner = nn.Parameter(torch.randn(NRF, Ns, dtype=torch.cfloat))
-
-    def get_analog_combiner(self):
-        return torch.exp(1j * self.analog_phases)  # [Nr, NRF]
-
-    def forward(self):
-        QA = self.get_analog_combiner()  # [Nr, NRF]
-        QD = self.digital_combiner       # [NRF, Ns]
-        Q = torch.matmul(QA, QD)          # [Nr, Ns]
-        return Q, QA, QD
 
 ##########################################
 # 2. WMMSE-Based Hybrid Beamforming Optimizer
@@ -399,18 +292,12 @@ def wmmse_hybrid_beamforming_opt(H, precoder_module, combiner_module, noise_powe
     
     return V_opt, Q_opt
 
-
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 #############################
 # Hybrid Precoders & Combiners
 #############################
 
 class HybridPrecoderModule(nn.Module):
-    def __init__(self, Nt, NRF, Ns):
+    def __init__(self, Nt, NRF, Ns, subcarriers=1):
         """
         Nt: number of transmit antennas
         NRF: number of RF chains
@@ -420,25 +307,31 @@ class HybridPrecoderModule(nn.Module):
         self.Nt = Nt
         self.NRF = NRF
         self.Ns = Ns
-        self.register_buffer("analog_phases", torch.rand(Nt, NRF) * 2 * math.pi)
-        angles = torch.rand(NRF, Ns) * 2 * math.pi
+        self.register_buffer("analog_phases", (torch.rand(Nt, NRF) * 2 * math.pi).to(torch.float32))
+        angles = torch.rand(subcarriers, NRF, Ns) * 2 * math.pi
         self.register_buffer("digital_precoder", torch.exp(1j * angles))
-
-
 
     
     def get_analog_precoder(self):
         # Constant-modulus analog precoder: exp(j*phase)
         return torch.exp(1j * self.analog_phases)  # shape: [Nt, NRF]
     
-    def forward(self):
-        VA = self.get_analog_precoder()         # [Nt, NRF]
-        VD = self.digital_precoder              # [NRF, Ns]
-        V = torch.matmul(VA, VD)                # Overall precoder: [Nt, Ns]
-        return V, VA, VD
+    def get_V(self):
+        VA = self.get_analog_precoder().to(torch.complex64)                    # [Nt, NRF]
+        VD = self.digital_precoder.to(torch.complex64)                          # [K, NRF, Ns]
+        V = torch.matmul(VA, VD)                                                # [K, Nt, Ns]
+
+        return V
+
+    def forward(self, s_t):
+        
+        # Apply hybrid precoder: X[k] = V[k] @ s[k]
+        x_t = torch.matmul(self.get_V(), s_t).squeeze(-1)             # [K, Nt]
+
+        return x_t
 
 class HybridCombinerModule(nn.Module):
-    def __init__(self, Nr, NRF, Ns):
+    def __init__(self, Nr, NRF, Ns, subcarriers=1):
         """
         Nr: number of receive antennas
         NRF: number of RF chains
@@ -448,24 +341,31 @@ class HybridCombinerModule(nn.Module):
         self.Nr = Nr
         self.NRF = NRF
         self.Ns = Ns
-        self.register_buffer("analog_phases", torch.rand(Nr, NRF) * 2 * math.pi)
-        angles = torch.rand(NRF, Ns) * 2 * math.pi
+        self.register_buffer("analog_phases", (torch.rand(Nr, NRF) * 2 * math.pi).to(torch.float32))
+        angles = torch.rand(subcarriers, NRF, Ns) * 2 * math.pi
         self.register_buffer("digital_combiner", torch.exp(1j * angles))
     
     def get_analog_combiner(self):
         return torch.exp(1j * self.analog_phases)  # [Nr, NRF]
     
-    def forward(self):
-        QA = self.get_analog_combiner()         # [Nr, NRF]
-        QD = self.digital_combiner              # [NRF, Ns]
-        Q = torch.matmul(QA, QD)                # Overall combiner: [Nr, Ns]
-        return Q, QA, QD
+    def get_Q(self):
+        QA = self.get_analog_combiner().to(torch.complex64)         # [Nr, NRF]
+        QD = self.digital_combiner.to(torch.complex64)              # [K, NRF, Ns]
+        Q = torch.matmul(QA, QD)                                    # Overall combiner: [Nr, Ns]
+        return Q
+    
+    def forward(self, y_t):
+
+        # Apply hybrid combiner: y[k] = Q[k]^H @ r[k]
+        QH = self.get_Q().conj().transpose(1, 2)              # [K, Ns, Nr]
+        s_hat_t = torch.matmul(QH, y_t.unsqueeze(-1)).squeeze(-1)  # [K, Ns]
+        return s_hat_t
 
 #########################################
 # Physical Layer Module
 #########################################
 class PhysicalLayerModule(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, device=None):
         """
         config should contain:
           Nt, Nr, NRF, Ns, num_subcarriers, noise_power, and channel parameters.
@@ -487,34 +387,99 @@ class PhysicalLayerModule(nn.Module):
         self.mary_modulation = MAryModulation(M=self.M)
         
         # Initialize hybrid precoder and combiner modules
-        self.precoder = HybridPrecoderModule(self.Nt, self.NRF, self.Ns)
-        self.combiner = HybridCombinerModule(self.Nr, self.NRF, self.Ns)
+        self.precoder = HybridPrecoderModule(self.Nt, self.NRF, self.Ns, self.num_subcarriers)
+        self.combiner = HybridCombinerModule(self.Nr, self.NRF, self.Ns, self.num_subcarriers)
+
+        # Initialize geometry-based channel model
+        self.channel = GeometryBasedChannel(self.Nt, self.Nr, self.num_clusters, self.num_rays, device=device, subcarriers=self.num_subcarriers)
+
+    def reshape_modulated_symbols_to_grid(self, modulated_symbols):
+        """
+        Reshape modulated symbols [L, B, len, group, 2] → [T, K, Ns]
+        where:
+            T = B * len,
+            K = L * group,
+            Ns = 2
+        """
+        L, B, length, group, ns = modulated_symbols.shape
+        assert ns == 2, "Last dimension should represent complex (real, imag)."
+
+        # Permute to [B, length, L, group, 2]
+        x = modulated_symbols.permute(1, 2, 0, 3, 4)  # [B, len, L, group, 2]
+
+        # Reshape: [B * len, L * group, 2] → [T, K, Ns]
+        modulated_grid = x.reshape(B * length, L * group, 2)
+
+        return modulated_grid  # [T, K, Ns]
     
-    def simulate_channel(self, B):
+    def reshape_grid_to_modulated_sequence(self, output_grid, shape):
         """
-        Simulate a geometry-based multi-path fading channel.
-        For each subcarrier and for each sample in the batch, generate a channel H.
-        Output shape: [B, num_subcarriers, Nr, Nt]
+        Reshape output_grid [T, K, 2] → [L, B, len, group, 2] using shape tuple.
+        """
+        L, B, length, group, _ = shape
+        T, K, Ns = output_grid.shape
+        assert T == B * length
+        assert K == L * group
+        assert Ns == 2
+
+        x = output_grid.reshape(B, length, L, group, 2)
+        output_sequence = x.permute(2, 0, 1, 3, 4).contiguous()
+        return output_sequence
+
+
+    def forward(self, symbols):
+        """
+        Forward pass through hybrid precoding, MIMO-OFDM channel, and combining.
+
+        Args:
+            modulated_grid: [T, K, Ns] - sequence of modulated features
+
+        Returns:
+            recovered_signal: [T, K, Ns] - after channel and beamforming
+        """
+        modulated_symbols = self.mary_modulation.modulate(symbols) #  [L, B, len, group, 2] complex
         
-        Here we use a simple random complex Gaussian channel as a placeholder.
-        """
-        H_real = torch.randn(B, self.num_subcarriers, self.Nr, self.Nt, device=self.precoder.analog_phases.device)
-        H_imag = torch.randn(B, self.num_subcarriers, self.Nr, self.Nt, device=self.precoder.analog_phases.device)
-        H = H_real + 1j * H_imag
-        # (A more detailed geometry-based channel model can be inserted here.)
-        return H
-    
-    def forward(self, modulated_grid):
-        """
-        modulated_grid: [B, K, NS] where K = num_subcarriers, NS = symbols per subcarrier.
-        Returns: recovered signal after beamforming and channel transmission, shape [B, K, NS]
-        """
-        B, K, NS = modulated_grid.shape
-        assert K == self.num_subcarriers, "Mismatch between grid subcarriers and config."
+        # modulated_grid: [T, K, Ns] where T = B * len, K = L * group, Ns = 2
+        modulated_grid = self.reshape_modulated_symbols_to_grid(modulated_symbols)  # [T, K, Ns]
+
+        T, K, Ns = modulated_grid.shape
+        assert K == self.num_subcarriers
+
+
+        output_sequence = []
+
+        for t in range(T):
+            s_t = modulated_grid[t]                        # [K, Ns]
+            s_t = s_t.unsqueeze(-1)                        # [K, Ns, 1]
+
+            # === Per-time step: update channel ===
+            self.channel.update_channel()                  # [K, Nr, Nt]  
+            H = self.channel.get_channel()                 # [K, Nr, Nt]
+            
+            # === Apply hybrid precoder ===
+            x_t = self.precoder(s_t)                       # [K, Nt]
+
+            # Apply channel: y[k] = H[k] @ x[k]
+            y_t = self.channel(x_t.unsqueeze(-1))     # [K, Nr]   
+
+            # === Apply hybrid combiner ===
+            s_hat_t = self.combiner(y_t).squeeze(0)       # [K, Ns]
+            output_sequence.append(s_hat_t)
+
+        output_grid = torch.stack(output_sequence, dim=0)  # [T, K, Ns]
         
-        # Simulate channel for each sample and subcarrier
-        H = self.simulate_channel(B)  # [B, K, Nr, Nt]
+        # Reshape output_grid: [T, K, Ns] → [L, B, len, group, 2]
+        output_sequence = self.reshape_grid_to_modulated_sequence(output_grid, modulated_symbols.shape)  # [L, B, len, group, 2]
+
+        # Apply modulation demodulation
+        demodulate_symbol = self.mary_modulation.demodulate(output_sequence)
+        return demodulate_symbol                               # [T, K, Ns]
         
+    def WMMSE(self, s_t, Weight=None, num_iter=10):
+        
+        Weight = Weight if Weight is not None else torch.full(
+            (self.K,), 1.0 / self.K, dtype=torch.float32, device=s_t.device
+        )
         # We now perform per-subcarrier beamforming.
         V_list = []  # List to hold overall precoders for each subcarrier, shape [B, Nt, Ns]
         Q_list = []  # List to hold overall combiners for each subcarrier, shape [B, Nr, Ns]
@@ -523,22 +488,21 @@ class PhysicalLayerModule(nn.Module):
         for k in range(K):
             V_sub = []
             Q_sub = []
-            for b in range(B):
-                # Get channel for batch element b and subcarrier k: [Nr, Nt]
-                H_bk = H[b, k, :, :]
-                # --- Digital update (closed-form) ---
-                VA = self.precoder.get_analog_precoder()  # [Nt, NRF]
-                VD = update_digital_precoder(H_bk, VA, self.noise_power)  # [NRF, Ns]
-                # Update digital precoder (detached from gradient; this optimization is separate)
-                self.precoder.digital_precoder.data.copy_(VD)
-                V_opt = torch.matmul(VA, VD)  # [Nt, Ns]
-                V_sub.append(V_opt)
-                
-                QA = self.combiner.get_analog_combiner()  # [Nr, NRF]
-                QD = update_digital_combiner(H_bk, QA, self.noise_power)  # [NRF, Ns]
-                self.combiner.digital_combiner.data.copy_(QD)
-                Q_opt = torch.matmul(QA, QD)  # [Nr, Ns]
-                Q_sub.append(Q_opt)
+            # Get channel for batch element b and subcarrier k: [Nr, Nt]
+            H_bk = H[b, k, :, :]
+            # --- Digital update (closed-form) ---
+            VA = self.precoder.get_analog_precoder()  # [Nt, NRF]
+            VD = update_digital_precoder(H_bk, VA, self.noise_power)  # [NRF, Ns]
+            # Update digital precoder (detached from gradient; this optimization is separate)
+            self.precoder.digital_precoder.data.copy_(VD)
+            V_opt = torch.matmul(VA, VD)  # [Nt, Ns]
+            V_sub.append(V_opt)
+            
+            QA = self.combiner.get_analog_combiner()  # [Nr, NRF]
+            QD = update_digital_combiner(H_bk, QA, self.noise_power)  # [NRF, Ns]
+            self.combiner.digital_combiner.data.copy_(QD)
+            Q_opt = torch.matmul(QA, QD)  # [Nr, Ns]
+            Q_sub.append(Q_opt)
             V_sub = torch.stack(V_sub, dim=0)  # [B, Nt, Ns]
             Q_sub = torch.stack(Q_sub, dim=0)  # [B, Nr, Ns]
             V_list.append(V_sub)

@@ -1400,7 +1400,7 @@ class TextOrientedImageGeneration(nn.Module):
 
         self.physical_layer = PhysicalLayerModule(self.config.physical_config, device=device)
 
-        self.RL_weight_agent = RLWeightingAgent(config.reduce_dim)
+        self.weight_module = WeightingModule(config.reduce_dim)
 
         self.decoder = CLIPSegDecoder(config)
         
@@ -1571,7 +1571,7 @@ class TextOrientedImageGeneration(nn.Module):
             transmitted_indices = torch.stack(transmitted_indices, dim=0)
             received = transmitted_indices
         else:
-            importance_weight = self.rl_agent.policy_nets(quantized_activation)
+            importance_weight = self.weight_module(quantized_activation)
             received = self.physical_layer(transmitted_indices, importance_weight)  #  [B, len, group] recovered indices
         recovered_embedding = self.quantizer.recover_embeddings(received)
         
@@ -2076,7 +2076,7 @@ class VectorQuantizer(nn.Module):
         return recovered
     
 
-class RLWeightingAgent(nn.Module):
+class WeightingModule(nn.Module):
     def __init__(self, input_dim, hidden_dim=64):
         """
         Args:

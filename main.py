@@ -609,10 +609,10 @@ def main(args):
     )
 
     # Create optimizer for RL_weight_agent only
-    rl_agent_params = [p for n, p in generator.named_parameters() if 'RL_weight_agent' in n and p.requires_grad]
+    WM_params = [p for n, p in generator.named_parameters() if 'weight_module' in n and p.requires_grad]
     optimizer_W = torch.optim.Adam(
-        rl_agent_params,
-        lr=args.learning_rate_rl,
+        WM_params,
+        lr=args.learning_rate_w,
         betas=(0.5, 0.999)
     )
             

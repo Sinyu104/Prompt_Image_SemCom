@@ -55,7 +55,7 @@ TRAIN_CMD="accelerate launch \
     --data_dir $DATA_DIR \
     --output_dir $OUTPUT_DIR \
     --batch_size $PER_GPU_BATCH_SIZE \
-    --num_epochs_1 400 \
+    --num_epochs_1 200 \
     --num_epochs_2 400 \
     --num_epochs_3 400 \
     --start_epoch 0 \

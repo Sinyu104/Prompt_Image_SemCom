@@ -470,14 +470,14 @@ def stage2_train(generator, discriminator, train_dataloader, optimizer, epoch, d
     return total_weight_loss / len(train_dataloader)
 
 
-def validate(generator, val_loader, epoch, device, args, accelerator):
+def validate(generator, val_loader, epoch, device, args, accelerator, stage=1):
     """Validate the model"""
     total_loss = 0
     num_batches = 0
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
             with autocast():
-                outputs = generator(batch['image'], batch['question'])
+                outputs = generator(batch['image'], batch['question'], stage=stage)
                 loss = (
                     args.loss_recon * outputs['loss_recon'] + 
                     args.loss_perc * outputs['loss_perc'] + 
@@ -670,11 +670,11 @@ def main(args):
                     pass
                 with autocast():
                     generator.train()
-                    if epoch < num_epochs_phase_1/2:
+                    if epoch < num_epochs_phase_1:
                         train_g_loss, train_q_loss = stage1_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator, phase=1)
                         # Run validation every 5 epochs
                         generator.eval()
-                        val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator)
+                        val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator, stage=1)
                         logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Val loss: {val_loss:.4f}")
                         scheduler_G.step()
                         # Log learning rate
@@ -708,7 +708,7 @@ def main(args):
                         train_g_loss, train_a_loss, train_d_loss, train_q_loss = stage1_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator, phase=2)
                         # Run validation every 5 epochs
                         generator.eval()
-                        val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator)
+                        val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator, stage=1)
                         logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Train A loss: {train_a_loss:.4f}, Train D loss: {train_d_loss:.4f}, Val loss: {val_loss:.4f}")
                         scheduler_G.step()
                         scheduler_D.step()
@@ -758,7 +758,7 @@ def main(args):
                         
                     # Run validation every 5 epochs
                     generator.eval()
-                    val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator)
+                    val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator, stage=2)
                     logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Val loss: {val_loss:.4f}")
                     
                     scheduler_W.step()

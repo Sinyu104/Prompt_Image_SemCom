@@ -38,6 +38,11 @@ class PhysicalConfig:
     num_clusters: int = 5
     num_rays: int = 10
 
+@dataclass
+class CodebookConfig:
+    num_embeddings: int
+    embedding_dim: int
+    commitment_cost: float
 
 @dataclass
 class ModelConfig:
@@ -62,6 +67,7 @@ class ModelConfig:
     extract_layers: List[int]
     vision_config: VisionConfig
     physical_config: PhysicalConfig
+    codebook_config: CodebookConfig
     gradient_checkpointing: bool
     freeze_vision_tower: bool
     freeze_llm: bool
@@ -85,8 +91,15 @@ class ModelConfig:
         physical_cfg_data = config_data.pop('physical_config')
         physical_cfg = PhysicalConfig(**physical_cfg_data)
 
+        # Handle codebook config.
+        codebook_cfg_data = config_data.pop('codebook_config')
+        codebook_cfg = CodebookConfig(**codebook_cfg_data)
+
         # Create ModelConfig instance with the remaining config data
-        return cls(vision_config=vision_cfg, physical_config=physical_cfg, **config_data)  
+        return cls(vision_config=vision_cfg,
+                   physical_config=physical_cfg,
+                   codebook_config=codebook_cfg,
+                   **config_data)
      
     def override_with_args(self, args):
         """

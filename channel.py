@@ -2,13 +2,16 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
-import torch
-import torch.nn as nn
-import math
+from pymanopt import Problem
+from pymanopt.optimizers import ConjugateGradient
+from pymanopt.manifolds import Product, Sphere
+from pymanopt.function import pytorch
+from pymanopt.manifolds import Euclidean
 
 class GeometryBasedChannel(nn.Module):
-    def __init__(self, Nt, Nr, NC, NR, device, subcarriers=1, wavelength=2.0, noise_power=1e-3):
+    def __init__(self, Nt, Nr, NC, NR, device, subcarriers=1, wavelength=2.0, noise_power=1):
         super().__init__()
         self.Nt = Nt
         self.Nr = Nr
@@ -57,9 +60,8 @@ class GeometryBasedChannel(nn.Module):
             H_k = A_r @ torch.diag(alpha_k) @ A_t.conj().transpose(0, 1)
             scaling = math.sqrt(self.Nt * self.Nr / P)
             H_b.append(scaling * H_k)
-        H_all.append(torch.stack(H_b, dim=0))  # [K, Nr, Nt]
-
-        return torch.stack(H_all, dim=0)  # [K, Nr, Nt]
+        
+        return torch.stack(H_b, dim=0)  # [K, Nr, Nt]
     def get_channel(self):
         """
         Get the current channel realization.
@@ -87,7 +89,7 @@ class GeometryBasedChannel(nn.Module):
 
         # Add complex AWGN
         noise = (torch.randn_like(Y) + 1j * torch.randn_like(Y)) * math.sqrt(self.noise_power / 2)
-        return Y+noise   # [K, Nr]
+        return Y+noise  # [K, Nr]
 
     
 class MAryModulation(nn.Module):
@@ -173,129 +175,10 @@ def constant_modulus(matrix):
     return torch.exp(1j * torch.angle(matrix))
 
 
-##########################################
-# 2. WMMSE-Based Hybrid Beamforming Optimizer
-##########################################
-def update_digital_precoder(H, VA, noise_power):
-    """
-    Given channel H [Nr, Nt] and current analog precoder VA [Nt, NRF],
-    update digital precoder VD by a closed‐form MMSE update.
-    Here we use a simplified MMSE formulation:
-    
-        VD = (VA^H H^H H VA + σ^2 I)^{-1} (VA^H H^H)
-    
-    so that the overall precoder is V = VA * VD.
-    """
-    NRF = VA.shape[1]
-    I = torch.eye(NRF, dtype=VA.dtype, device=VA.device)
-    A = torch.matmul(VA.conj().t(), torch.matmul(H.conj().t(), H) @ VA)
-    VD = torch.linalg.solve(A + noise_power * I, torch.matmul(VA.conj().t(), H.conj().t()))
-    return VD
 
-def update_digital_combiner(H, QA, noise_power):
-    """
-    Similarly, given channel H and analog combiner QA [Nr, NRF],
-    update digital combiner QD:
-    
-        QD = (QA^H H H^H QA + σ^2 I)^{-1} (QA^H H)
-    """
-    NRF = QA.shape[1]
-    I = torch.eye(NRF, dtype=QA.dtype, device=QA.device)
-    A = torch.matmul(QA.conj().t(), H @ H.conj().t() @ QA)
-    QD = torch.linalg.solve(A + noise_power * I, torch.matmul(QA.conj().t(), H))
-    return QD
-
-def manifold_gradient_step(phase_param, objective, lr):
-    """
-    Perform one Riemannian gradient descent step on the analog phase parameters.
-    phase_param: current phase parameters (real tensor)
-    objective: scalar objective from which we compute gradient w.r.t. phase_param.
-    lr: step size.
-    Returns: updated phase parameters.
-    """
-    # Compute gradient with respect to phase_param.
-    grad = torch.autograd.grad(objective, phase_param, retain_graph=True)[0]
-    # Simple gradient descent step
-    new_phase = phase_param - lr * grad
-    return new_phase
-
-def wmmse_hybrid_beamforming_opt(H, precoder_module, combiner_module, noise_power, weight=1.0, num_iter=10, analog_lr=0.01):
-    """
-    Alternating minimization to optimize the hybrid precoder and combiner
-    for a given channel H.
-    
-    H: channel matrix, shape [Nr, Nt] (complex)
-    precoder_module: an instance of HybridPrecoderModule
-    combiner_module: an instance of HybridCombinerModule
-    noise_power: scalar noise power
-    weight: weight parameter from WMMSE formulation (if needed)
-    num_iter: number of alternating iterations
-    analog_lr: step size for manifold (analog phase) updates.
-    
-    Returns: optimized overall precoder V and combiner Q.
-    """
-    # We assume that the modules’ analog parameters are our free variables.
-    # We detach the digital precoders from previous training (they are updated in closed-form).
-    for it in range(num_iter):
-        # Digital update:
-        VA = precoder_module.get_analog_precoder()  # [Nt, NRF]
-        VD = update_digital_precoder(H, VA, noise_power)  # [NRF, Ns]
-        precoder_module.digital_precoder.data.copy_(VD)
-        V = torch.matmul(VA, VD)  # Overall precoder
-        
-        QA = combiner_module.get_analog_combiner()  # [Nr, NRF]
-        QD = update_digital_combiner(H, QA, noise_power)  # [NRF, Ns]
-        combiner_module.digital_combiner.data.copy_(QD)
-        Q = torch.matmul(QA, QD)
-        
-        # Compute the effective channel: H_eff = Q^H H V
-        H_eff = torch.matmul(Q.conj().t(), torch.matmul(H, V))
-        # A typical weighted MMSE objective (simplified):
-        # J = tr((I + (1/noise_power) * H_eff^H H_eff)^{-1})
-        I = torch.eye(H_eff.shape[0], dtype=H_eff.dtype, device=H_eff.device)
-        J = torch.trace(torch.linalg.inv(I + (1/noise_power) * torch.matmul(H_eff.conj().t(), H_eff)))
-        
-        # For analog update, compute gradient with respect to the phase parameters.
-        # We update the precoder and combiner analog phases separately.
-        # Make sure the phase parameters require grad.
-        if not precoder_module.analog_phases.requires_grad:
-            precoder_module.analog_phases.requires_grad_(True)
-        if not combiner_module.analog_phases.requires_grad:
-            combiner_module.analog_phases.requires_grad_(True)
-        
-        # Compute gradients (using autograd) for the analog phase parameters.
-        # Here we treat J as the objective to minimize.
-        J.backward(retain_graph=True)
-        
-        # Update analog phases for precoder
-        with torch.no_grad():
-            new_precoder_phase = manifold_gradient_step(precoder_module.analog_phases, J, analog_lr)
-            precoder_module.analog_phases.copy_(new_precoder_phase)
-            new_combiner_phase = manifold_gradient_step(combiner_module.analog_phases, J, analog_lr)
-            combiner_module.analog_phases.copy_(new_combiner_phase)
-        
-        # Clear gradients for next iteration.
-        precoder_module.analog_phases.grad = None
-        combiner_module.analog_phases.grad = None
-        
-        # Optionally print or log the objective value.
-        print(f"Iteration {it+1}/{num_iter}, WMMSE Objective J = {J.item():.4f}")
-    
-    # After optimization, return the overall beamforming matrices.
-    VA_opt = constant_modulus(torch.exp(1j * precoder_module.analog_phases))
-    VD_opt = precoder_module.digital_precoder
-    V_opt = torch.matmul(VA_opt, VD_opt)
-    
-    QA_opt = constant_modulus(torch.exp(1j * combiner_module.analog_phases))
-    QD_opt = combiner_module.digital_combiner
-    Q_opt = torch.matmul(QA_opt, QD_opt)
-    
-    return V_opt, Q_opt
-
-#############################
+###############################
 # Hybrid Precoders & Combiners
-#############################
-
+###############################
 class HybridPrecoderModule(nn.Module):
     def __init__(self, Nt, NRF, Ns, subcarriers=1):
         """
@@ -307,28 +190,119 @@ class HybridPrecoderModule(nn.Module):
         self.Nt = Nt
         self.NRF = NRF
         self.Ns = Ns
+        # Analog phases are common to all subcarriers.
         self.register_buffer("analog_phases", (torch.rand(Nt, NRF) * 2 * math.pi).to(torch.float32))
+        # Digital precoder is subcarrier dependent: shape [K, NRF, Ns]
         angles = torch.rand(subcarriers, NRF, Ns) * 2 * math.pi
-        self.register_buffer("digital_precoder", torch.exp(1j * angles))
+        self.register_buffer("digital_precoder", torch.exp(1j * angles).to(torch.complex64))
 
-    
+        self.register_buffer("beta", torch.rand(subcarriers, dtype=torch.float32))  # scaling factor for the digital precoder
+
     def get_analog_precoder(self):
-        # Constant-modulus analog precoder: exp(j*phase)
-        return torch.exp(1j * self.analog_phases)  # shape: [Nt, NRF]
-    
-    def get_V(self):
-        VA = self.get_analog_precoder().to(torch.complex64)                    # [Nt, NRF]
-        VD = self.digital_precoder.to(torch.complex64)                          # [K, NRF, Ns]
-        V = torch.matmul(VA, VD)                                                # [K, Nt, Ns]
+        # Constant-modulus analog precoder: exp(j * phase)
+        return torch.exp((1j * self.analog_phases).to(torch.complex64))  # shape: [Nt, NRF]
 
+    def get_digital_precoder(self, k):
+        # Return the digital precoder for subcarrier k.
+        return self.digital_precoder[k].to(torch.complex64)
+
+    def set_digital_precoder(self, k, new_value):
+        # Update the digital precoder for subcarrier k.
+        self.digital_precoder[k].copy_(new_value)
+
+    def get_beta(self, k):
+        # Return the digital precoder for subcarrier k.
+        return self.beta[k].to(torch.float32)
+
+    def set_beta(self, k, new_value):
+        # Update the digital precoder for subcarrier k.
+        self.beta[k].copy_(new_value)
+
+    def get_V(self):
+        """
+        Compute the overall precoder for all subcarriers.
+        V = Va @ Vd, where Va is common and Vd is subcarrier dependent.
+        Returns V of shape [K, Nt, Ns]
+        """
+        VA = self.get_analog_precoder()                       # [Nt, NRF]
+        VD = self.digital_precoder                         # [K, NRF, Ns]
+        V = torch.matmul(VA, VD)                                # [K, Nt, Ns]
         return V
 
     def forward(self, s_t):
-        
-        # Apply hybrid precoder: X[k] = V[k] @ s[k]
-        x_t = torch.matmul(self.get_V(), s_t).squeeze(-1)             # [K, Nt]
-
+        # s_t: [K, Ns, 1]
+        # Apply hybrid precoder: x_t = V[k] @ s_t[k]
+        x_t = torch.matmul(self.get_V(), s_t).squeeze(-1)  # [K, Nt]
         return x_t
+
+    def update_precoder_wmmse_scalar(self, H_k, Q_k, w_scalar, noise_var):
+        """
+        Closed‐form update for the overall precoder for subcarrier k.
+        With fixed combiner Q_k and given weight (scalar) w_scalar, the update is:
+        V_k* = (w * H_k^H Q_k Q_k^H H_k + noise_var I)^{-1} (w * H_k^H Q_k)
+        """
+        Va = self.get_analog_precoder()                       # [Nt, NRF]
+        P = 1
+        # 1. Form the effective channel: H_eff = H_k * Va, shape: [Nr, NRF]
+        H_eff = Q_k.conj().T @ H_k @ Va  # shape: [Ns, NRF]
+
+        # 2. Compute a scalar factor from the combiner:
+        trace_Q = torch.trace(Q_k @ Q_k.conj().T).real  # scalar
+        
+        # 3. Compute the unscaled digital precoder V_u[k]:
+        # Here, we build the matrix to invert. Note that the noise term is scaled by trace_Q/w_scalar.
+        I_NRF = torch.eye(Va.shape[1], dtype=H_eff.dtype, device=H_eff.device)
+        A = (H_eff.conj().T @ H_eff + (noise_var * trace_Q * Va.conj().T @ Va))
+        B = H_eff.conj().T  # shape: [NRF, Ns]
+        V_u = torch.linalg.solve(A, B)  # unscaled digital precoder [NRF, Ns]
+        beta = 1.0
+        # Compute the total power of the transmitted precoder: 
+        # ||V_A * (V_u)||_F^2 = trace(Va * V_u * V_u^H * Va^H)
+        prod = Va @ V_u
+        power = torch.trace(prod @ prod.conj().T).real
+        beta = 1.0 / power.sqrt()
+        
+        # 5. Final digital precoder update:
+        Vd = beta * V_u
+
+        return Vd, beta
+
+    def optimize_analog_precoder_pymanopt(self, H, combiner_module, weight, noise_var, K):
+        """
+        Optimize the analog precoder phases using Pymanopt.
+        Instead of using Circle, we use Sphere(1) (i.e. points on S^1 ⊂ ℝ²).
+        """
+        Nt, N_RF = self.analog_phases.shape  # self.analog_phases is stored as angles (in radians).
+
+        # Manifold: optimize over Nt x N_RF real angles
+        manifold = Euclidean(Nt, N_RF)
+        
+        # Ensure all relevant data is on CPU
+        H = [h.cpu() for h in H]
+        weight = weight.cpu()
+
+        @pytorch(manifold)
+        def cost_precoder(theta):
+            # theta.requires_grad_(True)
+            Va = (torch.cos(theta) + 1j * torch.sin(theta)).to(torch.complex64)
+
+            J = 0.0
+            for k in range(K):
+                Vd_k = self.get_digital_precoder(k).detach().cpu()
+                Qa = combiner_module.get_analog_combiner().detach().cpu()
+                Qd_k = combiner_module.get_digital_combiner(k).detach().cpu()
+
+                Q_k = Qa @ Qd_k
+                J += weight[k].detach() * compute_J_k(H[k], Va, Q_k, noise_var)
+                
+            return J
+        problem = Problem(manifold=manifold, cost=cost_precoder)
+        solver = ConjugateGradient(max_iterations=200, verbosity=0)
+
+        optimal_x = solver.run(problem).point
+        new_angles = torch.tensor(optimal_x, dtype=self.analog_phases.dtype, device=self.analog_phases.device)
+        self.analog_phases.copy_(new_angles)
+
 
 class HybridCombinerModule(nn.Module):
     def __init__(self, Nr, NRF, Ns, subcarriers=1):
@@ -341,25 +315,97 @@ class HybridCombinerModule(nn.Module):
         self.Nr = Nr
         self.NRF = NRF
         self.Ns = Ns
+        # Analog phases for combiner.
         self.register_buffer("analog_phases", (torch.rand(Nr, NRF) * 2 * math.pi).to(torch.float32))
+        # Digital combiner is subcarrier dependent: shape [K, NRF, Ns]
         angles = torch.rand(subcarriers, NRF, Ns) * 2 * math.pi
         self.register_buffer("digital_combiner", torch.exp(1j * angles))
     
     def get_analog_combiner(self):
-        return torch.exp(1j * self.analog_phases)  # [Nr, NRF]
+        return torch.exp((1j * self.analog_phases).to(torch.complex64))  # [Nr, NRF]
     
+    def get_digital_combiner(self, k):
+        return self.digital_combiner[k].to(torch.complex64)
+    
+    def set_digital_combiner(self, k, new_value):
+        self.digital_combiner[k].copy_(new_value)
+
     def get_Q(self):
-        QA = self.get_analog_combiner().to(torch.complex64)         # [Nr, NRF]
-        QD = self.digital_combiner.to(torch.complex64)              # [K, NRF, Ns]
-        Q = torch.matmul(QA, QD)                                    # Overall combiner: [Nr, Ns]
+        """
+        Compute the overall combiner for all subcarriers.
+        Q = Qa @ Qd, where Qa is common and Qd is subcarrier dependent.
+        Returns Q of shape [K, Nr, Ns]
+        """
+        QA = self.get_analog_combiner()                        # [Nr, NRF]
+        QD = self.digital_combiner   # [K, NRF, Ns]
+        Q = torch.matmul(QA, QD)                                # [K, Nr, Ns]
+        
         return Q
     
     def forward(self, y_t):
-
-        # Apply hybrid combiner: y[k] = Q[k]^H @ r[k]
-        QH = self.get_Q().conj().transpose(1, 2)              # [K, Ns, Nr]
+        """
+        Apply the combiner: for each subcarrier k, s_hat = Q[k]^H @ y[k]
+        """
+        QH = self.get_Q().conj().transpose(1, 2)  # [K, Ns, Nr]
         s_hat_t = torch.matmul(QH, y_t.unsqueeze(-1)).squeeze(-1)  # [K, Ns]
         return s_hat_t
+    
+    def update_combiner_wmmse_scalar(self, H_k, V_k, noise_var, w_scalar, beta_k):
+        """
+        Closed‐form update for the overall combiner for subcarrier k.
+        With fixed precoder V_k, the update is:
+        Q_k* = (H_k V_k V_k^H H_k^H + noise_var I)^{-1} H_k V_k
+        """
+
+        Qa = self.get_analog_combiner()                       # [Nt, NRF]
+
+        H_eff = Qa.conj().T @ (H_k @ V_k)  # shape: [Ns, NRF]
+        A = (H_eff @ H_eff.conj().T + (noise_var / (beta_k ** 2)) * (Qa.conj().T @ Qa))
+        B = H_eff
+        Qd_star = torch.linalg.solve(A, B)
+
+
+        # Qd_star = Qd_star / torch.norm(Qd_star, p='fro') * math.sqrt(self.Ns)
+
+        return Qd_star
+
+    def optimize_analog_combiner_pymanopt(self, H, precoder_module, weight, noise_var, K):
+        """
+        Optimize the analog combiner phases using Pymanopt.
+        We represent each element on the unit circle as a point on S¹ (a 2D unit vector).
+        The manifold is defined as the product of Sphere(1) for each element in the analog combiner.
+        """
+        Nt, N_RF = self.analog_phases.shape  # self.analog_phases is stored as angles (in radians).
+
+        # Manifold: optimize over Nt x N_RF real angles
+        manifold = Euclidean(Nt, N_RF)
+        
+        # Ensure all relevant data is on CPU
+        H = [h.cpu() for h in H]
+        weight = weight.cpu()
+
+        @pytorch(manifold)
+        def cost_precoder(theta):
+            # theta.requires_grad_(True)
+            Qa = (torch.cos(theta) + 1j * torch.sin(theta)).to(torch.complex64)
+
+            I = 0.0
+            for k in range(K):
+                Qd_k = self.get_digital_combiner(k).detach().cpu()
+                Va = precoder_module.get_analog_precoder().detach().cpu()
+                Vd_k = precoder_module.get_digital_precoder(k).detach().cpu()
+                beta_k = precoder_module.get_beta(k).detach().cpu()
+
+                V_k = Va @ Vd_k
+                I += weight[k].detach() * compute_I_k(H[k], Qa, V_k, noise_var, beta_k)
+                
+            return I
+        problem = Problem(manifold=manifold, cost=cost_precoder)
+        solver = ConjugateGradient(max_iterations=200, verbosity=False)
+
+        optimal_x = solver.run(problem).point
+        new_angles = torch.tensor(optimal_x, dtype=self.analog_phases.dtype, device=self.analog_phases.device)
+        self.analog_phases.copy_(new_angles)
 
 #########################################
 # Physical Layer Module
@@ -371,7 +417,7 @@ class PhysicalLayerModule(nn.Module):
           Nt, Nr, NRF, Ns, num_subcarriers, noise_power, and channel parameters.
         """
         super(PhysicalLayerModule, self).__init__()
-        self.M = config.M # Modulation order
+        self.M = config.M  # Modulation order
         self.Nt = config.Nt
         self.Nr = config.Nr
         self.NRF = config.NRF
@@ -391,7 +437,7 @@ class PhysicalLayerModule(nn.Module):
         self.combiner = HybridCombinerModule(self.Nr, self.NRF, self.Ns, self.num_subcarriers)
 
         # Initialize geometry-based channel model
-        self.channel = GeometryBasedChannel(self.Nt, self.Nr, self.num_clusters, self.num_rays, device=device, subcarriers=self.num_subcarriers)
+        self.channel = GeometryBasedChannel(self.Nt, self.Nr, self.num_clusters, self.num_rays, device=device, subcarriers=self.num_subcarriers, noise_power=self.noise_power)
 
     def reshape_modulated_symbols_to_grid(self, modulated_symbols):
         """
@@ -403,13 +449,8 @@ class PhysicalLayerModule(nn.Module):
         """
         L, B, length, group, ns = modulated_symbols.shape
         assert ns == 2, "Last dimension should represent complex (real, imag)."
-
-        # Permute to [B, length, L, group, 2]
         x = modulated_symbols.permute(1, 2, 0, 3, 4)  # [B, len, L, group, 2]
-
-        # Reshape: [B * len, L * group, 2] → [T, K, Ns]
         modulated_grid = x.reshape(B * length, L * group, 2)
-
         return modulated_grid  # [T, K, Ns]
     
     def reshape_grid_to_modulated_sequence(self, output_grid, shape):
@@ -421,152 +462,204 @@ class PhysicalLayerModule(nn.Module):
         assert T == B * length
         assert K == L * group
         assert Ns == 2
-
         x = output_grid.reshape(B, length, L, group, 2)
         output_sequence = x.permute(2, 0, 1, 3, 4).contiguous()
         return output_sequence
 
-
     def forward(self, symbols, weight=None):
         """
         Forward pass through hybrid precoding, MIMO-OFDM channel, and combining.
-
-        Args:
-            modulated_grid: [T, K, Ns] - sequence of modulated features
-
-        Returns:
-            recovered_signal: [T, K, Ns] - after channel and beamforming
         """
-        modulated_symbols = self.mary_modulation.modulate(symbols) #  [L, B, len, group, 2] complex
-        
-        # modulated_grid: [T, K, Ns] where T = B * len, K = L * group, Ns = 2
+        modulated_symbols = self.mary_modulation.modulate(symbols)  # [L, B, len, group, 2] complex
         modulated_grid = self.reshape_modulated_symbols_to_grid(modulated_symbols)  # [T, K, Ns]
-
         T, K, Ns = modulated_grid.shape
         assert K == self.num_subcarriers
-
-
         output_sequence = []
+        self.channel.update_channel()      # update channel for current time step
+        H = self.channel.get_channel()     # [K, Nr, Nt]
+        for t in range(T): 
+            s_t = modulated_grid[t]            # [K, Ns]
+            weight_t = weight[t]
+            s_t = s_t.unsqueeze(-1)            # [K, Ns, 1]
+            self.wmmse_hybrid_beamforming(H, weight_t, noise_var=self.noise_power)   # Perform WMMSE optimization (updates precoder and combiner in-place)
 
-        for t in range(T):
-            s_t = modulated_grid[t]                        # [K, Ns]
-            s_t = s_t.unsqueeze(-1)                        # [K, Ns, 1]
 
-            # === Per-time step: update channel ===
-            self.channel.update_channel()                  # [K, Nr, Nt]  
-            H = self.channel.get_channel()                 # [K, Nr, Nt]
-            
-            # === Apply hybrid precoder ===
-            x_t = self.precoder(s_t)                       # [K, Nt]
+            x_t = self.precoder(s_t)           # [K, Nt]
+            y_t = self.channel(x_t.unsqueeze(-1))  # [K, Nr]
+            s_hat_t = self.combiner(y_t).squeeze(0)  # [K, Ns]
+            beta_all = torch.stack([self.precoder.get_beta(k) for k in range(K)])  # [K]
+            beta_all = beta_all.view(K, 1)
 
-            # Apply channel: y[k] = H[k] @ x[k]
-            y_t = self.channel(x_t.unsqueeze(-1))     # [K, Nr]   
+            # Undo beta scaling at receiver for fair comparison
+            s_hat_rescaled = s_hat_t / beta_all  # [K, Ns]
+            s_true = s_t.squeeze(-1)             # [K, Ns]
 
-            # === Apply hybrid combiner ===
-            s_hat_t = self.combiner(y_t).squeeze(0)       # [K, Ns]
-            output_sequence.append(s_hat_t)
+            # mse_direct = torch.mean(torch.abs(s_true - s_hat_rescaled) ** 2)
+            # print("s", s_true[0], "s_hat", s_hat_rescaled[0])
+            # print("Empirical MSE (post β rescaling):", mse_direct.item())
+            output_sequence.append(s_hat_rescaled)
 
         output_grid = torch.stack(output_sequence, dim=0)  # [T, K, Ns]
-        
-        # Reshape output_grid: [T, K, Ns] → [L, B, len, group, 2]
         output_sequence = self.reshape_grid_to_modulated_sequence(output_grid, modulated_symbols.shape)  # [L, B, len, group, 2]
-
-        # Apply modulation demodulation
         demodulate_symbol = self.mary_modulation.demodulate(output_sequence)
-        return demodulate_symbol                               # [T, K, Ns]
+        return demodulate_symbol  # [T, K, Ns]
+        # return output_grid
         
-    def WMMSE(self, s_t, Weight=None, num_iter=10):
+    def wmmse_hybrid_beamforming(self, H, weight, noise_var=1e-3, num_iters=10):
+        """
+        Perform the WMMSE optimization in two phases:
+        Phase 1: Optimize precoders (digital & analog) with combiners fixed.
+        Phase 2: Optimize combiners (digital & analog) with precoders fixed.
+        The provided weight vector (of shape [K]) remains fixed.
+        The analog updates are performed via Pymanopt.
+        """
+        K = H.shape[0]
         
-        Weight = Weight if Weight is not None else torch.full(
-            (self.K,), 1.0 / self.K, dtype=torch.float32, device=s_t.device
-        )
-        # We now perform per-subcarrier beamforming.
-        V_list = []  # List to hold overall precoders for each subcarrier, shape [B, Nt, Ns]
-        Q_list = []  # List to hold overall combiners for each subcarrier, shape [B, Nr, Ns]
-        
-        # For each subcarrier k, we optimize beamforming separately (here we do a few iterations)
-        for k in range(K):
-            V_sub = []
-            Q_sub = []
-            # Get channel for batch element b and subcarrier k: [Nr, Nt]
-            H_bk = H[b, k, :, :]
-            # --- Digital update (closed-form) ---
-            VA = self.precoder.get_analog_precoder()  # [Nt, NRF]
-            VD = update_digital_precoder(H_bk, VA, self.noise_power)  # [NRF, Ns]
-            # Update digital precoder (detached from gradient; this optimization is separate)
-            self.precoder.digital_precoder.data.copy_(VD)
-            V_opt = torch.matmul(VA, VD)  # [Nt, Ns]
-            V_sub.append(V_opt)
+        for it in range(num_iters):
+            # --- Phase 1: Update Precoder (Digital + Analog) with combiner fixed ---
+            # Update analog precoder using Pymanopt.
+            self.precoder.optimize_analog_precoder_pymanopt(H, self.combiner, weight, noise_var, K)
+
+            # Update digital precoder again using the analog precoder.
+            for k in range(K):
+                Va = self.precoder.get_analog_precoder()         # [Nt, NRF]
+                Vd = self.precoder.get_digital_precoder(k)          # [NRF, Ns]
+                V_k = Va @ Vd                                       # [Nt, Ns]
+                Qa = self.combiner.get_analog_combiner()            # [Nr, NRF]
+                Qd = self.combiner.get_digital_combiner(k)          # [NRF, Ns]
+                Q_k = Qa @ Qd                                       # [Nr, Ns]
+                # Compute the WMMSE update for the digital precoder.
+                Vd_k_star, beta = self.precoder.update_precoder_wmmse_scalar(H[k], Q_k, weight[k], noise_var)
+                self.precoder.set_digital_precoder(k, Vd_k_star)
+                self.precoder.set_beta(k, beta)
+
+
+
+            # --- Phase 2: Update Combiner (Digital + Analog) with precoder fixed ---
+            # Update analog combiner using Pymanopt.
+            self.combiner.optimize_analog_combiner_pymanopt(H, self.precoder, weight, noise_var, K)
+
+            for k in range(K):
+                Va = self.precoder.get_analog_precoder()         # [Nt, NRF]
+                Vd = self.precoder.get_digital_precoder(k)          # [NRF, Ns]
+                V_k = Va @ Vd                                       # [Nt, Ns]
+                beta = self.precoder.get_beta(k)
+                Qd_k_star = self.combiner.update_combiner_wmmse_scalar(H[k], V_k, noise_var, weight[k], beta)
+                self.combiner.set_digital_combiner(k, Qd_k_star)
+                
+            # Optionally, compute the total objective.
+            total_obj = 0.0
+            for k in range(K):
+                Va = self.precoder.get_analog_precoder()
+                Vd = self.precoder.get_digital_precoder(k)
+                V_k = Va @ Vd
+                beta = self.precoder.get_beta(k)
+                Qa = self.combiner.get_analog_combiner()
+                Qd = self.combiner.get_digital_combiner(k)
+                Q_k = Qa @ Qd     
+                MSE_k = compute_weighted_mse(H[k], Va, Vd, Qa, Qd, beta, noise_var)
+                total_obj += weight[k] * MSE_k
+                if is_main_process() and k==0:
+                    print(f"[iter {it+1}] Subcarrier {k}: trace(MSE_k) = {MSE_k:.4f}, "
+                    f"||V||_F^2 = {torch.norm(V_k, 'fro')**2:.4f}, "
+                    f"||Q||_F^2 = {torch.norm(Q_k, 'fro')**2:.4f}, "
+                    f"beta = {beta:.4f}, noise_var = {noise_var}, weight = {weight[k]:.4f}")
+                    print(f"[Subcarrier {k}] Norms: ||Va|| = {torch.norm(Va, 'fro'):.2f}, ||Vd_k|| = {torch.norm(Vd, 'fro'):.2f}")
+                    print(f"[Subcarrier {k}] Norms: ||Qa|| = {torch.norm(Qa, 'fro'):.2f}, ||Qd_k|| = {torch.norm(Qd, 'fro'):.2f}")
+                    print("Channel gain per subcarrier:", torch.norm(H[k], 'fro').item())
+            if is_main_process():
+                print(f"[Iter {it+1}/{num_iters}] Total Weighted WMMSE Objective = {total_obj.item():.4f}")
+            # input("Press Enter to continue...")  # Pause for user input after each iteration.
             
-            QA = self.combiner.get_analog_combiner()  # [Nr, NRF]
-            QD = update_digital_combiner(H_bk, QA, self.noise_power)  # [NRF, Ns]
-            self.combiner.digital_combiner.data.copy_(QD)
-            Q_opt = torch.matmul(QA, QD)  # [Nr, Ns]
-            Q_sub.append(Q_opt)
-            V_sub = torch.stack(V_sub, dim=0)  # [B, Nt, Ns]
-            Q_sub = torch.stack(Q_sub, dim=0)  # [B, Nr, Ns]
-            V_list.append(V_sub)
-            Q_list.append(Q_sub)
-        
-        # Stack the precoders and combiners along subcarrier dimension:
-        # V_all: [B, K, Nt, Ns], Q_all: [B, K, Nr, Ns]
-        V_all = torch.stack(V_list, dim=1)
-        Q_all = torch.stack(Q_list, dim=1)
-        
-        # Now, for each subcarrier, transmit the symbols:
-        # modulated_grid: [B, K, NS] -> unsqueeze last dim to [B, K, NS, 1]
-        S = modulated_grid.unsqueeze(-1)
-        # For each subcarrier k, the transmitted signal is: X = V[k] * S
-        # (Perform batch-matrix multiplication for each subcarrier)
-        X = torch.matmul(V_all, S)  # [B, K, Nt, 1]
-        X = X.squeeze(-1)  # [B, K, Nt]
-        
-        # Apply the channel: Y = H * X + noise. For each subcarrier, we treat X as [B, K, Nt, 1]
-        X_exp = X.unsqueeze(-1)  # [B, K, Nt, 1]
-        Y = torch.matmul(H, X_exp)  # [B, K, Nr, 1]
-        Y = Y.squeeze(-1)  # [B, K, Nr]
-        
-        # Add AWGN noise (complex Gaussian)
-        noise = (torch.sqrt(self.noise_power / 2) * 
-                 (torch.randn_like(Y) + 1j * torch.randn_like(Y)))
-        Y = Y + noise  # [B, K, Nr]
-        
-        # Receiver combining: for each subcarrier, s_hat = Q^H * Y.
-        # First, unsqueeze Y: [B, K, Nr, 1]
-        Y_exp = Y.unsqueeze(-1)
-        # Compute Q^H: for each subcarrier, Q_all: [B, K, Nr, Ns] -> QH: [B, K, Ns, Nr]
-        QH = Q_all.conj().permute(0, 1, 3, 2)
-        s_hat = torch.matmul(QH, Y_exp)  # [B, K, Ns, 1]
-        s_hat = s_hat.squeeze(-1)  # [B, K, Ns]
-        
-        return s_hat
 
-#########################################
-# Helper functions for digital updates
-#########################################
-def update_digital_precoder(H, VA, noise_power):
-    """
-    Given channel H [Nr, Nt] and analog precoder VA [Nt, NRF],
-    update digital precoder VD using an MMSE–like update:
-    
-    VD = (VA^H H^H H VA + σ^2 I)^{-1} (VA^H H^H)
-    """
-    NRF = VA.shape[1]
-    I = torch.eye(NRF, dtype=VA.dtype, device=VA.device)
-    A = torch.matmul(VA.conj().t(), torch.matmul(H.conj().t(), H) @ VA)
-    VD = torch.linalg.solve(A + noise_power * I, torch.matmul(VA.conj().t(), H.conj().t()))
-    return VD
 
-def update_digital_combiner(H, QA, noise_power):
+###############################
+# Helper Function
+###############################
+def compute_J_k(H_k, Va, Q_k, noise_var):
     """
-    Given channel H [Nr, Nt] and analog combiner QA [Nr, NRF],
-    update digital combiner QD:
-    
-    QD = (QA^H H H^H QA + σ^2 I)^{-1} (QA^H H)
+    Implements Equation (31):
+    J_k(Va) = tr( (I + 1 / (σ² * tr(Q^H Q)) * H^H Va (Va^H Va)^(-1) Va^H H )^(-1) )
     """
-    NRF = QA.shape[1]
-    I = torch.eye(NRF, dtype=QA.dtype, device=QA.device)
-    A = torch.matmul(QA.conj().t(), H @ H.conj().t() @ QA)
-    QD = torch.linalg.solve(A + noise_power * I, torch.matmul(QA.conj().t(), H))
-    return QD
+    Ns = Q_k.shape[1]  # output dimension
+    I_Ns = torch.eye(Ns, dtype=Va.dtype, device=Va.device)
 
+    QH_Q = Q_k.conj().T @ Q_k  # [Ns x Ns]
+    tr_QH_Q = torch.trace(QH_Q).real
+
+    # Compute the key intermediate product:
+    VaHV = Va.conj().T @ Va  # [NRF x NRF]
+    VaHV_inv = torch.linalg.inv(VaHV)
+
+    H_effk = (H_k.conj().T @Q_k)  # [Nt x Nr]
+
+    middle = H_effk.conj().T @ Va @ VaHV_inv @ Va.conj().T @ H_effk  # [Nt x Nt]
+
+    scale = 1.0 / (noise_var * tr_QH_Q)
+    A = I_Ns + scale * middle
+
+    Jk = torch.trace(torch.linalg.inv(A)).real
+    return Jk
+
+
+def compute_I_k(H_k, Qa, V_k, noise_var, beta):
+    """
+    Implements Equation (31):
+    J_k(Va) = tr( (I + 1 / (σ² * tr(Q^H Q)) * H^H Va (Va^H Va)^(-1) Va^H H )^(-1) )
+    """
+    Ns = V_k.shape[1]  # output dimension
+    I_Ns = torch.eye(Ns, dtype=Qa.dtype, device=Qa.device)
+
+    # Compute the key intermediate product:
+    QaHQ = Qa.conj().T @ Qa  # [NRF x NRF]
+    QaHQ_inv = torch.linalg.inv(QaHQ)
+
+    H_effk = (H_k@V_k)  # [Nt x Nr]
+
+    middle = H_effk.conj().T @ Qa @ QaHQ_inv @ Qa.conj().T @ H_effk  # [Nt x Nt]
+
+    scale = (beta ** 2) / noise_var
+    A = I_Ns + scale * middle
+
+    Ik = torch.trace(torch.linalg.inv(A)).real
+    return Ik
+
+def compute_weighted_mse(H_k, Va, Vd_k, Qa, Qd_k, beta_k, noise_var):
+    """
+    Compute the weighted MSE for subcarrier k using Equation (4).
+
+    H_k: [Nr, Nt]
+    Va: [Nt, NRF]  (analog precoder)
+    Vd_k: [NRF, Ns] (digital precoder)
+    Qa: [Nr, NRF]  (analog combiner)
+    Qd_k: [NRF, Ns] (digital combiner)
+    beta_k: scalar
+    noise_var: scalar
+    """
+
+    V_k = Va @ Vd_k         # [Nt, Ns]
+    Q_k = Qa @ Qd_k         # [Nr, Ns]
+    Q_H = Q_k.conj().T      # [Ns, Nr]
+
+    HV = H_k @ V_k          # [Nr, Ns]
+    QHHV = Q_H @ HV         # [Ns, Ns]
+    QHQ = Q_H @ Q_k         # [Ns, Ns]
+
+    term1 = (1 / beta_k**2) * Q_H @ HV @ HV.conj().T @ Q_k     # tr[ β⁻² Wᴴ H V Vᴴ Hᴴ W ]
+    term2 = (1 / beta_k) * QHHV                                # tr[ -β⁻¹ Wᴴ H V ]
+    term3 = (1 / beta_k) * QHHV.conj().T                       # tr[ -β⁻¹ Vᴴ Hᴴ W ]
+    term4 = (noise_var / beta_k**2) * QHQ                      # tr[ σ² β⁻² Wᴴ W ]
+    Ns = Vd_k.shape[1]
+    I = torch.eye(Ns, dtype=Va.dtype, device=Va.device)
+
+    mse_matrix = term1 - term2 - term3 + term4 + I
+    mse_scalar = torch.trace(mse_matrix).real
+    # if is_main_process():
+    #     print(f"MSE terms: {torch.trace(term1).real.item():.3f}, {torch.trace(term2).real.item():.3f}, {torch.trace(term3).real.item():.3f}, {torch.trace(term4).real.item():.3f}")
+    return mse_scalar
+
+def is_main_process():
+    """Check if this is the main process in DDP training or single-process training."""
+    if not torch.distributed.is_initialized():
+        return True
+    return torch.distributed.get_rank() == 0

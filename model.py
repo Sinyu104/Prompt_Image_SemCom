@@ -1398,17 +1398,19 @@ class TextOrientedImageGeneration(nn.Module):
             [nn.Linear(config.vision_config.hidden_size, config.reduce_dim) for _ in range(len(self.extract_layers))]
         )
 
+        self.len_seg = self.config.codebook_config.embedding_dim
+
         self.physical_layer = PhysicalLayerModule(self.config.physical_config, device=device)
 
-        self.weight_module = WeightingModule(config.reduce_dim)
+        self.weight_module = WeightingModule(self.len_seg)
 
         self.decoder = CLIPSegDecoder(config)
         
         # Add the vector quantizer
         self.quantizer = VectorQuantizer(
-            num_embeddings=64,  # 64 codes in codebook
-            embedding_dim=32,   # 32-bit codes
-            commitment_cost=0.25,
+            num_embeddings=self.config.codebook_config.num_embeddings,  # 64 codes in codebook
+            embedding_dim=self.config.codebook_config.embedding_dim,   # 32-bit codes
+            commitment_cost=self.config.codebook_config.commitment_cost,
             total_dim=config.reduce_dim,
         )
         
@@ -1550,6 +1552,7 @@ class TextOrientedImageGeneration(nn.Module):
                     " `config.projection_dim`."
                 )
 
+        local_embeddings = []
         transmitted_indices = []
         quantized_activations = []
         quantization_loss = 0
@@ -1559,6 +1562,7 @@ class TextOrientedImageGeneration(nn.Module):
             
 
             local_embedding = self.film_mul[i](conditional_embeddings) * activation.permute(1, 0, 2) + self.film_add[i](conditional_embeddings)
+            local_embeddings.append(local_embedding.permute(1, 0, 2))
             quantized_activation, q_loss, quantized_indices = self.quantizer(local_embedding.permute(1, 0, 2))
             quantized_activations.append(quantized_activation)
             quantization_loss += q_loss
@@ -1566,12 +1570,13 @@ class TextOrientedImageGeneration(nn.Module):
             transmitted_index = quantized_indices.detach()  # simulate transmission
             transmitted_indices.append(transmitted_index)
         
+        local_embeddings = torch.stack(local_embeddings, dim=0)
         quantized_activations = torch.stack(quantized_activations, dim=0)
         if stage == 1:
             transmitted_indices = torch.stack(transmitted_indices, dim=0)
             received = transmitted_indices
         else:
-            importance_weight = self.weight_module(quantized_activation)
+            importance_weight = self.weight_module(local_embeddings, self.len_seg)
             received = self.physical_layer(transmitted_indices, importance_weight)  #  [B, len, group] recovered indices
         recovered_embedding = self.quantizer.recover_embeddings(received)
         
@@ -2076,11 +2081,12 @@ class VectorQuantizer(nn.Module):
         return recovered
     
 
+
 class WeightingModule(nn.Module):
     def __init__(self, input_dim, hidden_dim=64):
         """
         Args:
-            input_dim (int): Dimension of the token embedding.
+            input_dim (int): Dimension of the token embedding (should equal seg).
             hidden_dim (int): Hidden size of the network.
         """
         super().__init__()
@@ -2088,17 +2094,46 @@ class WeightingModule(nn.Module):
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()  # Outputs importance weights ∈ (0, 1)
+            nn.Sigmoid()  # Outputs importance weights in (0, 1)
         )
 
-    def forward(self, embeddings):
+    def forward(self, embeddings, seg):
         """
         Args:
-            embeddings: Tensor [L, B, len, D]
+            embeddings: Tensor of shape [L, B, len, D], where
+                        L = number of layers,
+                        B = batch size,
+                        len (N) = sequence length,
+                        D = token dimension.
+            seg: An integer factor such that D is divisible by seg.
         Returns:
-            importance_weights: Tensor [L, B, len]
+            importance_weights: Tensor of shape [L, B, len]
+                                (one importance weight per layer, per sample, per token position)
         """
-        L, B, T, D = embeddings.shape
-        flat = embeddings.view(-1, D)  # [L * B * T, D]
-        weights = self.policy(flat).view(L, B, T)  # [L, B, len]
+        L, B, N, D = embeddings.shape
+        assert D % seg == 0, "D must be divisible by seg."
+
+        # Step 1. Permute to bring batch and sequence dimensions together:
+        # From [L, B, N, D] to [B, N, L, D]
+        x = embeddings.permute(1, 2, 0, 3)  # shape: [B, N, L, D]
+
+        # Step 2. Reshape D into two factors: (D // seg) and seg.
+        x = x.view(B, N, L, D // seg, seg)  # shape: [B, N, L, D//seg, seg]
+
+        # Step 3. Combine the L and (D // seg) dimensions:
+        x = x.reshape(B, N, L * (D // seg), seg)  # shape: [B, N, L*(D//seg), seg]
+
+        # Step 4. Merge B and N so that we can apply the policy network on each token of size seg.
+        x_flat = x.view(B * N, L * (D // seg), seg)  # shape: [B*N, L*(D//seg), seg]
+
+        # Apply the policy network on each token.
+        # We flatten the last two dims so that each row is a token of dimension 'seg'
+        tokens = x_flat.contiguous()               # shape: [B*N, L*(D//seg), seg]
+        weights = self.policy(tokens)              # shape: [B*N, L*(D//seg), 1]
+        # Reshape back to [B*N, L*(D//seg)]
+        weights = weights.squeeze(-1)
+
+        # Normalize each row so that its sum equals 1.
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)
         return weights
+

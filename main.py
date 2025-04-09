@@ -627,7 +627,7 @@ def main(args):
             return 1.0
         else:
             # Cosine decay
-            progress = (epoch - warmup_epochs) / (args.num_epochs - warmup_epochs)
+            progress = (epoch - warmup_epochs) / (args.num_epochs_1 - warmup_epochs)
             return 0.01 + (1 - 0.01) * 0.5 * (1 + math.cos(math.pi * progress))
     
     scheduler_G = torch.optim.lr_scheduler.LambdaLR(optimizer_G, lr_lambda)
@@ -659,7 +659,7 @@ def main(args):
         # Training loop
         if args.start_stage == 1:
             logger.info("Starting training stage 1: Encoder-Decoder")
-            num_epochs_phase_1 = args.num_epochs_1/2
+            num_epochs_phase_1 = 0
 
             for epoch in range(start_epoch, args.num_epochs_1):
                 if epoch == start_epoch:

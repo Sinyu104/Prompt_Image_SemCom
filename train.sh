@@ -32,8 +32,8 @@ PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
 OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
 # OUTPUT_DIR="$HOME/prompt_image_segment/outputs/20250225_164551"
-# RESUME_DIR="$HOME/prompt_image_segment/outputs/codebook_reduce_dim_512_20250304_231036/checkpoints/checkpoint_epoch_54_loss_1.5045.pth"
-RESUME_DIR=None
+RESUME_DIR="$HOME/prompt_image_segment/outputs/stage1_phase2_20250404_000529/checkpoints/checkpoint_epoch_70_loss_1.4366.pth"
+# RESUME_DIR=None
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -59,7 +59,7 @@ TRAIN_CMD="accelerate launch \
     --num_epochs_2 400 \
     --num_epochs_3 400 \
     --start_epoch 0 \
-    --start_stage 1 \
+    --start_stage 2 \
     --learning_rate_g 1e-4 \
     --learning_rate_d 1e-5 \
     --learning_rate_w 1e-4 \

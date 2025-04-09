@@ -23,6 +23,7 @@ checkpoints/
 train.sh
 split_cache/
 copy_to_cc.sh
+channel_eval.py
 *.pth
 *.ckpt
 *.pt

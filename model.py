@@ -1706,25 +1706,26 @@ class AnswerGenerationModel(nn.Module):
         ]).to(self.llava.device)
         
         # Process entire batch at once for feature extraction
-        image_outputs = self.llava(
-            padded_ids,
-            images=images,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=True
-        ).hidden_states
-        
-        gen_outputs = self.llava(
-            padded_ids,
-            images=generated_images,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=True
-        ).hidden_states
+        with torch.no_grad():
+            image_outputs = self.llava(
+                padded_ids,
+                images=images,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=True
+            ).hidden_states
+            
+            gen_outputs = self.llava(
+                padded_ids,
+                images=generated_images,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=True
+            ).hidden_states
         
         # Extract features from selected layers
-        image_features = [image_outputs[i] for i in self.selected_layers]
-        gen_features = [gen_outputs[i] for i in self.selected_layers]
+        image_features = [image_outputs[i].detach() for i in self.selected_layers]
+        gen_features = [gen_outputs[i].detach() for i in self.selected_layers]
         
         # Compute perceptual loss at each layer and average
         layer_losses = []

@@ -664,10 +664,9 @@ def main(args):
             for epoch in range(start_epoch, args.num_epochs_1):
                 if epoch == start_epoch:
                     logger.info("Starting training in phase I")
-                elif epoch == num_epochs_phase_1:
+                if epoch == num_epochs_phase_1:
                     logger.info("Starting training in phase II")
-                else:
-                    pass
+            
                 with autocast():
                     generator.train()
                     if epoch < num_epochs_phase_1:

@@ -24,7 +24,7 @@ export NUMEXPR_NUM_THREADS=8  # NumExpr parallelism
 
 
 # Set initial batch size (will be divided by number of GPUs)
-TOTAL_BATCH_SIZE=3  # Further reduce batch size
+TOTAL_BATCH_SIZE=6  # Further reduce batch size
 NUM_GPUS=3
 PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
@@ -32,8 +32,8 @@ PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
 OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
 # OUTPUT_DIR="$HOME/prompt_image_segment/outputs/20250225_164551"
-RESUME_DIR="$HOME/prompt_image_segment/outputs/stage1_phase2_20250404_000529/checkpoints/checkpoint_epoch_70_loss_1.4366.pth"
-# RESUME_DIR=None
+# RESUME_DIR="$HOME/prompt_image_segment/outputs/stage1_phase2_20250404_000529/checkpoints/checkpoint_epoch_70_loss_1.4366.pth"
+RESUME_DIR=None
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"

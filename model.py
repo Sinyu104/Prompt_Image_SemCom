@@ -1821,18 +1821,18 @@ class VQAWithSegmentation(nn.Module):
         self.processor = AutoProcessor.from_pretrained("CIDAS/clipseg-rd64-refined", do_rescale=False)
         
         # Initialize VGG perceptual loss
-        self.vgg_loss = VGGPerceptualLoss(
-            layers=["relu1_2", "relu2_2", "relu3_3"],
-            use_l1=True
-        ).to(device)
+        # self.vgg_loss = VGGPerceptualLoss(
+        #     layers=["relu1_2", "relu2_2", "relu3_3"],
+        #     use_l1=True
+        # ).to(device)
         
         # Initialize models
         self.image_generation_model = TextOrientedImageGeneration(config=config, device=self.device)
-        # self.perceptual_model = AnswerGenerationModel(
-        #     model_path="qnguyen3/nanoLLaVA-1.5",
-        #     load_in_8bit=False,
-        #     device=self.device
-        # )
+        self.perceptual_model = AnswerGenerationModel(
+            model_path="qnguyen3/nanoLLaVA-1.5",
+            load_in_8bit=False,
+            device=self.device
+        )
 
         # Reconstruction Loss (e.g., L1 Loss)
         self.recon_loss = nn.L1Loss()
@@ -1879,21 +1879,21 @@ class VQAWithSegmentation(nn.Module):
         # 2. Perceptual Loss
         # --------------------
         # Add batch dimension for interpolation
-        # generated_normalized = F.interpolate(self.perceptual_preprocess(generated_images), 
-        #                                   size=(384, 384), mode='bilinear', align_corners=False)
-        # targets_normalized = F.interpolate(self.perceptual_preprocess(images),
-        #                                  size=(384, 384), mode='bilinear', align_corners=False)
+        generated_normalized = F.interpolate(self.perceptual_preprocess(generated_images), 
+                                          size=(384, 384), mode='bilinear', align_corners=False)
+        targets_normalized = F.interpolate(self.perceptual_preprocess(images),
+                                         size=(384, 384), mode='bilinear', align_corners=False)
 
-        # perceptual_loss = self.perceptual_model(targets_normalized, generated_normalized, questions)['loss_perc']
+        perceptual_loss = self.perceptual_model(targets_normalized, generated_normalized, questions)['loss_perc']
         
         # Add VGG perceptual loss
-        vgg_loss = self.vgg_loss(generated_images, images)
+        # vgg_loss = self.vgg_loss(generated_images, images)
         
         return {
             'generated_images': outputs.logits,
             'loss_recon': recon_loss,
-            'loss_perc': 0,
-            'loss_vgg': vgg_loss,
+            'loss_perc': perceptual_loss,
+            'loss_vgg': 0,
             'quantization_loss': quantization_loss,
         }
 
@@ -1969,11 +1969,6 @@ class PatchGANDiscriminator(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-def is_main_process():
-    """Check if this is the main process in DDP training or single process training"""
-    if not torch.distributed.is_initialized():
-        return True
-    return torch.distributed.get_rank() == 0
 
 
 

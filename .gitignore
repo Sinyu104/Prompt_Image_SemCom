@@ -19,6 +19,7 @@ prompt_image_segment/
 outputs/
 wandb/
 VQAv2/
+gqa_data/
 checkpoints/
 train.sh
 split_cache/

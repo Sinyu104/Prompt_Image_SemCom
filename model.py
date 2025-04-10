@@ -41,6 +41,7 @@ import torchvision
 from torchvision import models
 import torch.nn.utils.spectral_norm as spectral_norm
 from channel import PhysicalLayerModule
+from transformers import CLIPModel, CLIPProcessor
 
 
 logger = logging.get_logger(__name__)
@@ -1624,151 +1625,58 @@ class TextOrientedImageGeneration(nn.Module):
 
 
 class AnswerGenerationModel(nn.Module):
-    def __init__(self, model_path, load_in_8bit=False, device=None):
+    def __init__(self, model_name='openai/clip-vit-base-patch16', device=None):
         super().__init__()
-        
-        # Initialize LLaVA model
-        self.llava = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.float32,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-            device_map=None,  # Let DDP handle device placement
-        )
-        if not self.llava.get_vision_tower().is_loaded:
-            self.llava.get_vision_tower().load_model()
-        
-        # Freeze LLaVA model
-        for param in self.llava.parameters():
-            param.requires_grad = False
-        
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            trust_remote_code=True
-        )
-        # Configure generation settings
-        self.generation_config = GenerationConfig.from_pretrained(model_path)
-        self.generation_config.pad_token_id = self.tokenizer.eos_token_id
-        self.generation_config.eos_token_id = self.tokenizer.eos_token_id
-        self.llava.generation_config = self.generation_config
-        
-        # Define layers for perceptual loss
-        # Early layers (5): low-level features
-        # Middle layers (9): mid-level patterns
-        # Later layers (12): high-level semantics
-        self.selected_layers = [5, 9, 12]
-        
-        # Perceptual Loss
+
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Load CLIP model and processor
+        self.clip = CLIPModel.from_pretrained(model_name).eval().to(self.device)
+        self.processor = CLIPProcessor.from_pretrained(model_name)
+
+        # Perceptual loss
         self.perc_loss = nn.L1Loss()
-        
+
+
     def forward(self, images, generated_images, questions):
-        """Forward pass for answer generation"""
-        # Process all questions in batch at once
-        if isinstance(questions, list):
-            messages = [{"role": "user", "content": f'<image>\n{q}'} for q in questions]
-        else:
-            messages = [{"role": "user", "content": f'<image>\n{q}'} for q in questions]
-        
-        # Batch process all texts
-        texts = [
-            self.tokenizer.apply_chat_template(
-                [msg], tokenize=False, add_generation_prompt=True
-            ) for msg in messages
-        ]
-        
-        # Process all inputs in batch
-        input_ids_list = []
-        attention_mask_list = []
-        for text in texts:
-            chunks = [self.tokenizer(chunk).input_ids for chunk in text.split('<image>')]
-            input_ids = torch.tensor(chunks[0] + [-200] + chunks[1], dtype=torch.long)
-            input_ids_list.append(input_ids)
-            # Create attention mask (1 for real tokens, 0 for padding)
-            attention_mask_list.append(torch.ones_like(input_ids))
-        
-        # Pad input_ids to same length
-        max_len = max(ids.size(0) for ids in input_ids_list)
-        # Ensure all ranks use the same max_len
-        if torch.distributed.is_initialized():
-            max_len_tensor = torch.tensor(max_len, device=self.llava.device)
-            torch.distributed.all_reduce(max_len_tensor, op=torch.distributed.ReduceOp.MAX)
-            max_len = int(max_len_tensor.item())
-        
-        # Pad both input_ids and attention_mask
-        padded_ids = torch.stack([
-            F.pad(ids, (0, max_len - ids.size(0)), value=self.tokenizer.pad_token_id)
-            for ids in input_ids_list
-        ]).to(self.llava.device)
-        
-        attention_mask = torch.stack([
-            F.pad(mask, (0, max_len - mask.size(0)), value=0)
-            for mask in attention_mask_list
-        ]).to(self.llava.device)
-        
-        # Process entire batch at once for feature extraction
-        with torch.no_grad():
-            image_outputs = self.llava(
-                padded_ids,
-                images=images,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                use_cache=True
-            ).hidden_states
-            
-            gen_outputs = self.llava(
-                padded_ids,
-                images=generated_images,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                use_cache=True
-            ).hidden_states
-        
-        # Extract features from selected layers
-        image_features = [image_outputs[i].detach() for i in self.selected_layers]
-        gen_features = [gen_outputs[i].detach() for i in self.selected_layers]
-        
-        # Compute perceptual loss at each layer and average
-        layer_losses = []
-        for img_feat, gen_feat in zip(image_features, gen_features):
-            layer_losses.append(self.perc_loss(gen_feat, img_feat))
-        loss_perc = torch.stack(layer_losses).mean()
-        
-        # During training, skip text generation completely
-        responses = [""] * images.size(0)
-        
-        # Only do generation during eval
-        if not self.training:
-            with torch.no_grad():
-                # Generate text only on rank 0
-                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                    for i in range(images.size(0)):
-                        output_id = self.llava.generate(
-                            padded_ids[i:i+1],
-                            images=generated_images[i:i+1],
-                            attention_mask=attention_mask[i:i+1],
-                            max_new_tokens=2048,
-                            use_cache=True,
-                            synced_gpus=False,  # Disable syncing during generation
-                            generation_config=self.generation_config
-                        )[0]
-                        responses[i] = self.tokenizer.decode(
-                            output_id[padded_ids[i].size(0):],
-                            skip_special_tokens=True
-                        ).strip()
-                # Broadcast responses from rank 0 to all other ranks
-                if torch.distributed.is_initialized():
-                    responses_tensor = torch.tensor([len(r) for r in responses], device=self.llava.device)
-                    torch.distributed.broadcast(responses_tensor, src=0)
-                    for i, length in enumerate(responses_tensor):
-                        if torch.distributed.get_rank() != 0:
-                            responses[i] = " " * length  # Placeholder for non-rank-0
-        
+        """Forward pass using CLIP for perceptual alignment"""
+        # Ensure images and texts are lists
+        if not isinstance(questions, list):
+            questions = [questions]
+
+        images = images.detach().clamp(0, 1).cpu()
+        generated_images = generated_images.detach().clamp(0, 1).cpu()
+
+        loss_perc = F.l1_loss(images, generated_images)
+
+        # Tokenize with text
+        inputs_real = self.processor(text=questions, images=images, return_tensors="pt", padding=True, do_rescale=False)
+        inputs_gen = self.processor(text=questions, images=generated_images, return_tensors="pt", padding=True, do_rescale=False)
+
+        # Move inputs to device
+        inputs_real = {k: v.to(self.device) for k, v in inputs_real.items()}
+        inputs_gen = {k: v.to(self.device) for k, v in inputs_gen.items()}
+
+        img_feats_real = self.clip.get_image_features(pixel_values=inputs_real["pixel_values"])
+        img_feats_gen  = self.clip.get_image_features(pixel_values=inputs_gen["pixel_values"])
+        txt_feats      = self.clip.get_text_features(input_ids=inputs_real["input_ids"], attention_mask=inputs_real["attention_mask"])
+
+        img_feats_real = F.normalize(img_feats_real, dim=-1)
+        img_feats_gen  = F.normalize(img_feats_gen, dim=-1)
+        txt_feats      = F.normalize(txt_feats, dim=-1)
+
+        # Compute cosine similarity
+        cos_sim_real = (img_feats_real * txt_feats).sum(dim=-1)
+        cos_sim_gen  = (img_feats_gen * txt_feats).sum(dim=-1)
+
+        loss_perc = F.l1_loss(cos_sim_gen, cos_sim_real)
+
         return {
-            'text': responses,
-            'gen_features': gen_features,
-            'target_features': image_features,
+            'cos_gen_features': cos_sim_gen,
+            'cos_target_features': cos_sim_real,
             'loss_perc': loss_perc,
         }
+
 
 
 class VGGPerceptualLoss(nn.Module):
@@ -1822,16 +1730,15 @@ class VQAWithSegmentation(nn.Module):
         self.processor = AutoProcessor.from_pretrained("CIDAS/clipseg-rd64-refined", do_rescale=False)
         
         # Initialize VGG perceptual loss
-        # self.vgg_loss = VGGPerceptualLoss(
-        #     layers=["relu1_2", "relu2_2", "relu3_3"],
-        #     use_l1=True
-        # ).to(device)
+        self.vgg_loss = VGGPerceptualLoss(
+            layers=["relu1_2", "relu2_2", "relu3_3"],
+            use_l1=True
+        ).to(device)
         
         # Initialize models
         self.image_generation_model = TextOrientedImageGeneration(config=config, device=self.device)
         self.perceptual_model = AnswerGenerationModel(
-            model_path="qnguyen3/nanoLLaVA-1.5",
-            load_in_8bit=False,
+            model_name='openai/clip-vit-base-patch16',
             device=self.device
         )
 
@@ -1880,21 +1787,16 @@ class VQAWithSegmentation(nn.Module):
         # 2. Perceptual Loss
         # --------------------
         # Add batch dimension for interpolation
-        generated_normalized = F.interpolate(self.perceptual_preprocess(generated_images), 
-                                          size=(384, 384), mode='bilinear', align_corners=False)
-        targets_normalized = F.interpolate(self.perceptual_preprocess(images),
-                                         size=(384, 384), mode='bilinear', align_corners=False)
-
-        perceptual_loss = self.perceptual_model(targets_normalized, generated_normalized, questions)['loss_perc']
+        perceptual_loss = self.perceptual_model(images, generated_images, questions)['loss_perc']
         
         # Add VGG perceptual loss
-        # vgg_loss = self.vgg_loss(generated_images, images)
+        vgg_loss = self.vgg_loss(generated_images, images)
         
         return {
             'generated_images': outputs.logits,
             'loss_recon': recon_loss,
             'loss_perc': perceptual_loss,
-            'loss_vgg': 0,
+            'loss_vgg': vgg_loss,
             'quantization_loss': quantization_loss,
         }
 

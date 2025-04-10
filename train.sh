@@ -24,15 +24,15 @@ export NUMEXPR_NUM_THREADS=8  # NumExpr parallelism
 
 
 # Set initial batch size (will be divided by number of GPUs)
-TOTAL_BATCH_SIZE=2  # Further reduce batch size
+TOTAL_BATCH_SIZE=8  # Further reduce batch size
 NUM_GPUS=2
 PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
 # Directory paths
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
-OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
-# OUTPUT_DIR="$HOME/prompt_image_segment/outputs/20250225_164551"
-RESUME_DIR="$HOME/prompt_image_segment/outputs/stage1_phase2_20250404_000529/checkpoints/checkpoint_epoch_70_loss_1.4366.pth"
+# OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_20250409_191851"
+RESUME_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_20250409_191851/checkpoints/checkpoint_epoch_3_loss_0.1743.pth"
 # RESUME_DIR=None
 
 # Create output directory
@@ -58,21 +58,21 @@ TRAIN_CMD="accelerate launch \
     --num_epochs_1 200 \
     --num_epochs_2 200 \
     --num_epochs_3 200 \
-    --start_epoch 0 \
+    --start_epoch 101 \
     --start_stage 1 \
     --learning_rate_g 1e-4 \
     --learning_rate_d 1e-5 \
     --learning_rate_w 1e-4 \
     --weight_decay 0.01 \
     --num_workers 1 \
-    --discriminator_update_freq 1 \
+    --discriminator_update_freq 2 \
     --lambda_sparsity 0.0 \
     --lambda_smoothness 0.0 \
     --lambda_answer 0.0 \
     --loss_recon 1.0 \
-    --loss_perc 3.0 \
+    --loss_perc 1.0 \
     --loss_vgg 1.0 \
-    --loss_quant 0.5 \
+    --loss_quant 0.1 \
     --loss_gen 1.0 \
     --loss_disc 0.5 \
     --log_interval 200 \

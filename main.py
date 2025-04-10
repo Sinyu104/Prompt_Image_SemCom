@@ -269,9 +269,8 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
             total_d_loss = 0
             total_a_loss = 0
             total_q_loss = 0
-            lambda_gp = 3.0
+            lambda_gp = 1.0
             for batch_idx, batch in enumerate(train_dataloader):
-            
                 # Train Discriminator only on even batch indices
                 optimizer_G.zero_grad()
                 with autocast():
@@ -288,6 +287,7 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
                     
                     # Total generator loss: include reconstruction, VGG, adversarial (WGAN) and feature matching losses
                     g_loss = (
+                        args.loss_recon * outputs['loss_recon'] +
                         args.loss_perc   * outputs['loss_perc'] +
                         args.loss_vgg   * outputs['loss_vgg'] +
                         args.loss_gen   * g_loss_adv +
@@ -299,31 +299,32 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
                 torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
                 optimizer_G.step()
 
-
-                optimizer_D.zero_grad()
-                with autocast():
-                    # Compute scores on real and fake images
-                    real_score = discriminator(batch['image'])
-                    fake_score = discriminator(generated_images.detach())
-                    # WGAN discriminator loss: maximize (real_score - fake_score), so minimize negative of that
-                    d_loss_adv = -(real_score.mean() - fake_score.mean())
-                    
-                    # Compute gradient penalty
-                    gp = gradient_penalty(discriminator, batch['image'], generated_images.detach(), device, lambda_gp=lambda_gp)
-                    
-                    logger.debug(f"Gradient penalty: {gp}, Discriminator loss: {d_loss_adv}")
-                    
-                    # Total discriminator loss: adversarial loss + weighted gradient penalty
-                    d_loss = d_loss_adv + lambda_gp * gp
+                if batch_idx % args.discriminator_update_freq  == 0:
+                    # Train Discriminator
+                    optimizer_D.zero_grad()
+                    with autocast():
+                        # Compute scores on real and fake images
+                        real_score = discriminator(batch['image'])
+                        fake_score = discriminator(generated_images.detach())
+                        # WGAN discriminator loss: maximize (real_score - fake_score), so minimize negative of that
+                        d_loss_adv = -(real_score.mean() - fake_score.mean())
                         
-                    accelerator.backward(d_loss)
-                    for name, param in discriminator.named_parameters():
-                        if param.grad is not None and torch.isnan(param.grad).any():
-                            print(f"NaN detected in gradient of {name}")
-                            break
-                    # Clip gradients for discriminator
-                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
-                    optimizer_D.step()
+                        # Compute gradient penalty
+                        gp = gradient_penalty(discriminator, batch['image'], generated_images.detach(), device, lambda_gp=lambda_gp)
+                        
+                        logger.debug(f"Gradient penalty: {gp}, Discriminator loss: {d_loss_adv}")
+                        
+                        # Total discriminator loss: adversarial loss + weighted gradient penalty
+                        d_loss = d_loss_adv + lambda_gp * gp
+                            
+                        accelerator.backward(d_loss)
+                        for name, param in discriminator.named_parameters():
+                            if param.grad is not None and torch.isnan(param.grad).any():
+                                print(f"NaN detected in gradient of {name}")
+                                break
+                        # Clip gradients for discriminator
+                        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+                        optimizer_D.step()
 
                 total_g_loss += g_loss.item()  # Track generator loss
                 total_a_loss += g_loss_adv.item()  # Track VGG loss

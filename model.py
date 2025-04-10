@@ -1637,6 +1637,9 @@ class AnswerGenerationModel(nn.Module):
         # Perceptual loss
         self.perc_loss = nn.L1Loss()
 
+        for param in self.clip.parameters():
+            param.requires_grad = False  # Freeze CLIP parameters
+
 
     def forward(self, images, generated_images, questions):
         """Forward pass using CLIP for perceptual alignment"""

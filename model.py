@@ -1472,6 +1472,7 @@ class TextOrientedImageGeneration(nn.Module):
         interpolate_pos_encoding: bool = True,
         return_dict: Optional[bool] = None,
         stage: Optional[int] = 0,
+        textalign: Optional[bool] = True,
     ) -> Union[Tuple, CLIPSegOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1561,8 +1562,10 @@ class TextOrientedImageGeneration(nn.Module):
         for i, (activation, reduce) in enumerate(zip(activations, self.reduces)):
             activation = reduce(activation)
             
-
-            local_embedding = self.film_mul[i](conditional_embeddings) * activation.permute(1, 0, 2) + self.film_add[i](conditional_embeddings)
+            if textalign:
+                local_embedding = self.film_mul[i](conditional_embeddings) * activation.permute(1, 0, 2) + self.film_add[i](conditional_embeddings)
+            else:
+                local_embedding = activation.permute(1, 0, 2)
             local_embeddings.append(local_embedding.permute(1, 0, 2))
             quantized_activation, q_loss, quantized_indices = self.quantizer(local_embedding.permute(1, 0, 2))
             quantized_activations.append(quantized_activation)
@@ -1650,8 +1653,6 @@ class AnswerGenerationModel(nn.Module):
         images = images.detach().clamp(0, 1).cpu()
         generated_images = generated_images.detach().clamp(0, 1).cpu()
 
-        loss_perc = F.l1_loss(images, generated_images)
-
         # Tokenize with text
         inputs_real = self.processor(text=questions, images=images, return_tensors="pt", padding=True, do_rescale=False)
         inputs_gen = self.processor(text=questions, images=generated_images, return_tensors="pt", padding=True, do_rescale=False)
@@ -1671,8 +1672,9 @@ class AnswerGenerationModel(nn.Module):
         # Compute cosine similarity
         cos_sim_real = (img_feats_real * txt_feats).sum(dim=-1)
         cos_sim_gen  = (img_feats_gen * txt_feats).sum(dim=-1)
+        
 
-        loss_perc = F.l1_loss(cos_sim_gen, cos_sim_real)
+        loss_perc = F.l1_loss(cos_sim_gen, cos_sim_real)*10
 
         return {
             'cos_gen_features': cos_sim_gen,
@@ -1753,7 +1755,7 @@ class VQAWithSegmentation(nn.Module):
         ])
         
         
-    def forward(self, images, questions, stage=None):
+    def forward(self, images, questions, stage=None, textalign=True):
         # Process images and text separately
         image_inputs = self.processor.image_processor(
             images=images,
@@ -1777,7 +1779,7 @@ class VQAWithSegmentation(nn.Module):
         
         # Move all inputs to device
         inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-        outputs = self.image_generation_model(**inputs, stage=stage)
+        outputs = self.image_generation_model(**inputs, stage=stage, textalign=textalign)
         generated_images = outputs.logits  # Keep batch dimension
         quantization_loss = outputs.quantization_loss
         

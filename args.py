@@ -31,6 +31,8 @@ def parse_args():
                        help="Starting epoch number (useful for resuming training)")
     parser.add_argument("--start_stage", type=int, choices=[1, 2, 3], default=1,
                        help="Starting training stage: 1 (encoder-decoder), 2 (semantic-aware HBF), 3 (full fine-tuning)")
+    parser.add_argument("--textalign", type=bool, default=True,
+                       help="Whether to use text alignment")
     
     # Dataset and model arguments
     parser.add_argument("--batch_size", type=int, default=32)

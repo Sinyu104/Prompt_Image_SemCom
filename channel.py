@@ -560,16 +560,9 @@ class PhysicalLayerModule(nn.Module):
                 MSE_k = compute_weighted_mse(H[k], Va, Vd, Qa, Qd, beta, noise_var)
                 total_obj += weight[k] * MSE_k
                 if is_main_process() and k==0:
-                    print(f"[iter {it+1}] Subcarrier {k}: trace(MSE_k) = {MSE_k:.4f}, "
-                    f"||V||_F^2 = {torch.norm(V_k, 'fro')**2:.4f}, "
-                    f"||Q||_F^2 = {torch.norm(Q_k, 'fro')**2:.4f}, "
-                    f"beta = {beta:.4f}, noise_var = {noise_var}, weight = {weight[k]:.4f}")
-                    print(f"[Subcarrier {k}] Norms: ||Va|| = {torch.norm(Va, 'fro'):.2f}, ||Vd_k|| = {torch.norm(Vd, 'fro'):.2f}")
-                    print(f"[Subcarrier {k}] Norms: ||Qa|| = {torch.norm(Qa, 'fro'):.2f}, ||Qd_k|| = {torch.norm(Qd, 'fro'):.2f}")
-                    print("Channel gain per subcarrier:", torch.norm(H[k], 'fro').item())
+                    print(f"[iter {it+1}] Subcarrier {k}: trace(MSE_k) = {MSE_k:.4f}, ")
             if is_main_process():
                 print(f"[Iter {it+1}/{num_iters}] Total Weighted WMMSE Objective = {total_obj.item():.4f}")
-            # input("Press Enter to continue...")  # Pause for user input after each iteration.
             
 
 

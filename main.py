@@ -124,44 +124,42 @@ def calculate_total_loss(outputs, args):
     return total_loss
 
 def gradient_penalty(critic, real_data, fake_data, device, lambda_gp=10.0):
-    
     batch_size = real_data.size(0)
-    alpha = torch.rand(batch_size, 1, 1, 1, device=device).expand_as(real_data)
-    interpolates = alpha * real_data + ((1 - alpha) * fake_data)
-    interpolates = interpolates.to(device).requires_grad_(True)
     
+    # Ensure no gradient history is retained
+    real_data = real_data.detach()
+    fake_data = fake_data.detach()
+    
+    alpha = torch.rand(batch_size, 1, 1, 1, device=device)
+    interpolates = alpha * real_data + (1 - alpha) * fake_data
+    interpolates.requires_grad_(True)
+
     d_interpolates = critic(interpolates)
-    d_interpolates = d_interpolates.view(batch_size, -1)  # [batch_size, num_patches]
+    d_interpolates = d_interpolates.view(batch_size, -1)
 
     try:
-        fake = torch.ones_like(d_interpolates, device=device, requires_grad=False)
-        
+        fake = torch.ones_like(d_interpolates, device=device)
+
         gradients = torch.autograd.grad(
             outputs=d_interpolates,
             inputs=interpolates,
-            grad_outputs=fake,  # Now grad_outputs is defined
+            grad_outputs=fake,
             create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
+            retain_graph=False,
+            only_inputs=True
         )[0]
-        
-        # Reshape and compute gradient norm
-        gradients = gradients.reshape(batch_size, -1)
+
+        gradients = gradients.view(batch_size, -1)
         grad_norm = gradients.norm(2, dim=1)
-        
-        # Compute gradient penalty
-        gradient_penalty = ((grad_norm - 1) ** 2).mean()/gradients.shape[1]
-        
-        # Ensure penalty requires grad
-        if not gradient_penalty.requires_grad:
-            gradient_penalty.requires_grad_(True)
-            
-        return gradient_penalty
-        
+        penalty = ((grad_norm - 1) ** 2).mean()
+
+
+        return penalty
+
     except Exception as e:
         print(f"Error computing gradient penalty: {str(e)}")
-        # Return a differentiable zero tensor
         return torch.tensor(0.0, device=device, requires_grad=True)
+
    
 def feature_matching_loss(discriminator, real_images, fake_images, loss_fn=F.l1_loss):
     """
@@ -282,8 +280,6 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
                     # WGAN generator loss: maximize fake_score, so minimize negative score
                     g_loss_adv = -fake_score.mean()
                     
-                    # Feature matching loss from discriminator intermediate features
-                    # fm_loss = feature_matching_loss(discriminator, batch['image'], generated_images)
                     
                     # Total generator loss: include reconstruction, VGG, adversarial (WGAN) and feature matching losses
                     g_loss = (
@@ -308,7 +304,7 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
                         fake_score = discriminator(generated_images.detach())
                         # WGAN discriminator loss: maximize (real_score - fake_score), so minimize negative of that
                         d_loss_adv = -(real_score.mean() - fake_score.mean())
-                        
+                        logger.debug(f"real_score : {real_score.mean().item()}, fake_score: {fake_score.mean().item()}")
                         # Compute gradient penalty
                         gp = gradient_penalty(discriminator, batch['image'], generated_images.detach(), device, lambda_gp=lambda_gp)
                         
@@ -318,10 +314,10 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
                         d_loss = d_loss_adv + lambda_gp * gp
                             
                         accelerator.backward(d_loss)
-                        for name, param in discriminator.named_parameters():
-                            if param.grad is not None and torch.isnan(param.grad).any():
-                                print(f"NaN detected in gradient of {name}")
-                                break
+                        # for name, param in discriminator.named_parameters():
+                        #     if param.grad is not None and torch.isnan(param.grad).any():
+                        #         print(f"NaN detected in gradient of {name}")
+                        #         break
                         # Clip gradients for discriminator
                         torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
                         optimizer_D.step()
@@ -338,7 +334,6 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
                         "D_loss": f"{d_loss.item():.4f}"
                     })
                     progress_bar.update(1)
-                
                 # Log batch statistics only on main process
                 if accelerator.is_main_process and batch_idx % args.log_interval == 0:
                     with torch.no_grad():
@@ -360,15 +355,16 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
                 
                 if accelerator.is_main_process and batch_idx % args.log_interval == 0:
                     logger.debug(
-                        "Batch %d stats - Loss components: recon=%.4f, perc=%.4f, vgg=%.4f, adv=%.4f, d=%4f",
+                        "Batch %d stats - Loss components: recon=%.4f, perc=%.4f, vgg=%.4f, adv=%.4f, d=%4f, gp=%.4f",
                         batch_idx,
-                        outputs["loss_recon"],
+                        outputs["loss_recon"].item(),
                         outputs["loss_perc"],
-                        outputs["loss_vgg"],
+                        outputs["loss_vgg"].item(),
                         g_loss_adv.item(),
                         d_loss.item(),
-                        # gp.item(),
+                        gp.item(),
                     )  
+
         else:
             Exception("Invalid stage for training")
         

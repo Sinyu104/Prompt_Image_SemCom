@@ -9,6 +9,13 @@ import numpy as np
 import torch.distributed as dist
 from torch.cuda.amp import autocast
 
+import os
+import json
+import base64
+from torchvision.utils import save_image
+from io import BytesIO
+from PIL import Image
+
 def setup_logger(args):
     """Setup logger with file and console handlers"""
     # Only setup logger on the main process
@@ -167,6 +174,28 @@ def cleanup_distributed():
     """Cleanup distributed training resources"""
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+
+def store_generated_outputs(image_tensor, question, answer, image_id, save_path):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    
+    # Convert to PIL and encode
+    image = image_tensor.mul(255).clamp(0, 255).byte().cpu().permute(1, 2, 0).numpy()
+    pil_image = Image.fromarray(image)
+    buffered = BytesIO()
+    pil_image.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+    # Save as JSONL
+    entry = {
+        "image_id": image_id,
+        "question": question,
+        "answer": answer,
+        "image_base64": img_str
+    }
+    with open(save_path, 'a') as f:
+        f.write(json.dumps(entry) + '\n')
         
 @torch.no_grad()
 def visualize_batch(image, generated_images, question, gt_answer, epoch, batch_idx, args, mode='train'):

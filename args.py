@@ -31,12 +31,15 @@ def parse_args():
                        help="Starting epoch number (useful for resuming training)")
     parser.add_argument("--start_stage", type=int, choices=[1, 2, 3], default=1,
                        help="Starting training stage: 1 (encoder-decoder), 2 (semantic-aware HBF), 3 (full fine-tuning)")
-    parser.add_argument("--textalign", type=bool, default=True,
-                       help="Whether to use text alignment")
+    parser.add_argument("--textalign", action="store_true", 
+                       help="Enable text alignment")
+    parser.add_argument("--store_gen_data", action="store_true", 
+                       help="Whether to store generator data")
     
     # Dataset and model arguments
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--output_dir", type=str, default="outputs")
+    parser.add_argument("--generated_data_dir", type=str, default="generated data dir")
     parser.add_argument('--data_dir', type=str, required=True, help='Path to VQA v2 dataset')
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--resume_from_checkpoint', type=str, default=None)

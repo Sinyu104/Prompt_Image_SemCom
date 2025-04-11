@@ -22,6 +22,8 @@ export OMP_NUM_THREADS=8  # Parallel operations
 export MKL_NUM_THREADS=8  # Intel MKL parallelism
 export NUMEXPR_NUM_THREADS=8  # NumExpr parallelism
 
+export TORCH_USE_CUDA_DSA=1
+
 
 # Set initial batch size (will be divided by number of GPUs)
 TOTAL_BATCH_SIZE=4  # Further reduce batch size
@@ -34,6 +36,7 @@ OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_$(d
 # OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_20250409_191851"
 RESUME_DIR="$HOME/prompt_image_segment/outputs/stage1_phase2_20250404_000529/checkpoints/checkpoint_epoch_70_loss_1.4366.pth"
 # RESUME_DIR=None
+STORE_DIR="$HOME/prompt_image_segment/stored_data/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -58,9 +61,9 @@ TRAIN_CMD="accelerate launch \
     --num_epochs_1 200 \
     --num_epochs_2 200 \
     --num_epochs_3 200 \
-    --start_epoch 0\
+    --start_epoch 100\
     --start_stage 1 \
-    --textalign True \
+    --textalign \
     --learning_rate_g 1e-4 \
     --learning_rate_d 1e-5 \
     --learning_rate_w 1e-4 \
@@ -82,7 +85,8 @@ TRAIN_CMD="accelerate launch \
     --split_level2 subject \
     --train_category animal \
     --val_category human \
-    --resume_from_checkpoint $RESUME_DIR"
+    --resume_from_checkpoint $RESUME_DIR\
+    --generated_data_dir $STORE_DIR"
 
 # Execute the training command
 eval $TRAIN_CMD

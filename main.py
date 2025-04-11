@@ -35,6 +35,7 @@ import sys
 import logging
 import torch.autograd
 from args import parse_args
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from utils import (
     setup_logger, 
     print_network_info, 
@@ -43,7 +44,8 @@ from utils import (
     load_checkpoint,
     setup_distributed_training,
     cleanup_distributed,
-    visualize_batch
+    visualize_batch,
+    store_generated_outputs
 )
 import math
 
@@ -123,41 +125,58 @@ def calculate_total_loss(outputs, args):
     
     return total_loss
 
-def gradient_penalty(critic, real_data, fake_data, device, lambda_gp=10.0):
-    batch_size = real_data.size(0)
+def unwrap_fsdp(module):
+    return module.module if isinstance(module, FSDP) else module
+
+def gradient_penalty(discriminator, real_data, fake_data, device, lambda_gp=10.0):
+    # Unwrap FSDP to access the actual model
+    raw_discriminator = unwrap_fsdp(discriminator)
+
+    # Save current training mode
+    was_training = raw_discriminator.training
+    raw_discriminator.eval()
+
     
-    # Ensure no gradient history is retained
+    batch_size = real_data.size(0)
     real_data = real_data.detach()
     fake_data = fake_data.detach()
+    alpha = torch.rand(batch_size, 1, 1, 1, device=device).expand_as(real_data)
+    interpolates = alpha * real_data + ((1 - alpha) * fake_data)
+    if not torch.isfinite(interpolates).all():
+        raise ValueError("Interpolates contain NaNs or Infs.")
     
-    alpha = torch.rand(batch_size, 1, 1, 1, device=device)
-    interpolates = alpha * real_data + (1 - alpha) * fake_data
-    interpolates.requires_grad_(True)
-
-    d_interpolates = critic(interpolates)
-    d_interpolates = d_interpolates.view(batch_size, -1)
+    with torch.autograd.set_detect_anomaly(True):
+        interpolates = interpolates.to(device).requires_grad_(True)
+        interpolates = torch.clamp(interpolates, 0, 1)
+        d_interpolates = raw_discriminator(interpolates)
+        d_interpolates = d_interpolates.view(batch_size, -1)  # [batch_size, num_patches]
 
     try:
-        fake = torch.ones_like(d_interpolates, device=device)
-
+        fake = torch.ones_like(d_interpolates, device=device, requires_grad=False)
+        
         gradients = torch.autograd.grad(
             outputs=d_interpolates,
             inputs=interpolates,
-            grad_outputs=fake,
-            create_graph=True,
-            retain_graph=False,
-            only_inputs=True
+            grad_outputs=fake,  # Now grad_outputs is defined
+            create_graph=False,
+            retain_graph=True,
+            only_inputs=True,
         )[0]
-
-        gradients = gradients.view(batch_size, -1)
+        
+        # Reshape and compute gradient norm
+        gradients = gradients.reshape(batch_size, -1)
         grad_norm = gradients.norm(2, dim=1)
-        penalty = ((grad_norm - 1) ** 2).mean()
-
-
-        return penalty
-
+        
+        # Compute gradient penalty
+        gradient_penalty = ((grad_norm - 1) ** 2).mean()
+        # Restore original mode
+        if was_training:
+            raw_discriminator.train()
+        return gradient_penalty
+    
     except Exception as e:
         print(f"Error computing gradient penalty: {str(e)}")
+        # Return a differentiable zero tensor
         return torch.tensor(0.0, device=device, requires_grad=True)
 
    
@@ -180,7 +199,7 @@ def feature_matching_loss(discriminator, real_images, fake_images, loss_fn=F.l1_
 
 def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, device, args, accelerator, phase=1):
     """Train for one epoch with separate generator and discriminator steps"""
-    # torch.autograd.set_detect_anomaly(True)  # Enable anomaly detection
+    torch.autograd.set_detect_anomaly(True)  # Enable anomaly detection
     
     logger = logging.getLogger('training')
     generator.train()
@@ -271,7 +290,7 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
             for batch_idx, batch in enumerate(train_dataloader):
                 # Train Discriminator only on even batch indices
                 optimizer_G.zero_grad()
-                with autocast():
+                with autocast(enabled=False):
                     outputs = generator(batch['image'], batch['question'], stage=1)
                     generated_images = outputs['generated_images']
                     generated_images = torch.clamp(generated_images, 0, 1)
@@ -298,29 +317,28 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
                 if batch_idx % args.discriminator_update_freq  == 0:
                     # Train Discriminator
                     optimizer_D.zero_grad()
-                    with autocast():
-                        # Compute scores on real and fake images
-                        real_score = discriminator(batch['image'])
-                        fake_score = discriminator(generated_images.detach())
-                        # WGAN discriminator loss: maximize (real_score - fake_score), so minimize negative of that
-                        d_loss_adv = -(real_score.mean() - fake_score.mean())
-                        logger.debug(f"real_score : {real_score.mean().item()}, fake_score: {fake_score.mean().item()}")
-                        # Compute gradient penalty
-                        gp = gradient_penalty(discriminator, batch['image'], generated_images.detach(), device, lambda_gp=lambda_gp)
-                        
-                        logger.debug(f"Gradient penalty: {gp}, Discriminator loss: {d_loss_adv}")
-                        
-                        # Total discriminator loss: adversarial loss + weighted gradient penalty
-                        d_loss = d_loss_adv + lambda_gp * gp
+                    with torch.no_grad():  # Make sure this forward is safe
+                        outputs = generator(batch['image'], batch['question'], stage=1)
+                        generated_images = torch.clamp(outputs['generated_images'], 0, 1)
+                    with torch.autograd.set_detect_anomaly(True):
+                        with autocast(enabled=False):
+                            # Compute scores on real and fake images
+                            real_score = discriminator(batch['image'])
+                            fake_score = discriminator(generated_images.detach())
+                            # WGAN discriminator loss: maximize (real_score - fake_score), so minimize negative of that
+                            d_loss_adv = -(real_score.mean() - fake_score.mean())
+
+                            logger.debug(f"real_score : {real_score.mean().item()}, fake_score: {fake_score.mean().item()}")
+                            # Compute gradient penalty
+                            gp = gradient_penalty(discriminator, batch['image'], generated_images.detach(), device, lambda_gp=lambda_gp)
                             
-                        accelerator.backward(d_loss)
-                        # for name, param in discriminator.named_parameters():
-                        #     if param.grad is not None and torch.isnan(param.grad).any():
-                        #         print(f"NaN detected in gradient of {name}")
-                        #         break
-                        # Clip gradients for discriminator
-                        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
-                        optimizer_D.step()
+                            
+                            # Total discriminator loss: adversarial loss + weighted gradient penalty
+                            d_loss = d_loss_adv + lambda_gp * gp
+                            accelerator.backward(d_loss)
+                            # Clip gradients for discriminator
+                            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+                            optimizer_D.step()
 
                 total_g_loss += g_loss.item()  # Track generator loss
                 total_a_loss += g_loss_adv.item()  # Track VGG loss
@@ -471,24 +489,67 @@ def stage2_train(generator, discriminator, train_dataloader, optimizer, epoch, d
     return total_weight_loss / len(train_dataloader)
 
 
+# def validate(generator, val_loader, epoch, device, args, accelerator, stage=1):
+#     """Validate the model"""
+#     total_loss = 0
+#     num_batches = 0
+#     with torch.no_grad():
+#         for batch_idx, batch in enumerate(val_loader):
+#             with autocast():
+#                 outputs = generator(batch['image'], batch['question'], stage=stage)
+#                 loss = (
+#                     args.loss_recon * outputs['loss_recon'] + 
+#                     args.loss_perc * outputs['loss_perc'] + 
+#                     args.loss_vgg * outputs['loss_vgg']
+#                 )
+#                 total_loss += loss.item()
+#                 num_batches += 1
+    
+#     avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+#     return avg_loss
+
+
+
 def validate(generator, val_loader, epoch, device, args, accelerator, stage=1):
-    """Validate the model"""
+    """Validate the model and optionally store generated outputs."""
     total_loss = 0
     num_batches = 0
+
+    save_path = None
+    gen_file = None
+
+    if args.store_gen_data:
+        os.makedirs(args.generated_data_dir, exist_ok=True)
+        save_path = os.path.join(args.generated_data_dir, f"generated_epoch_{epoch}.jsonl")
+
     with torch.no_grad():
+
         for batch_idx, batch in enumerate(val_loader):
             with autocast():
                 outputs = generator(batch['image'], batch['question'], stage=stage)
+
                 loss = (
-                    args.loss_recon * outputs['loss_recon'] + 
-                    args.loss_perc * outputs['loss_perc'] + 
+                    args.loss_recon * outputs['loss_recon'] +
+                    args.loss_perc * outputs['loss_perc'] +
                     args.loss_vgg * outputs['loss_vgg']
                 )
                 total_loss += loss.item()
                 num_batches += 1
-    
+
+                if args.store_gen_data:
+                    for i in range(outputs['generated_images'].size(0)):
+                        store_generated_outputs(
+                            outputs['generated_images'][i],
+                            batch['question'][i],
+                            batch['answer_text'][i],
+                            batch['image_id'][i].item() if torch.is_tensor(batch['image_id'][i]) else batch['image_id'][i],
+                            save_path
+                        )
+
     avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
     return avg_loss
+
+
 
 def main(args):
     # Setup logger
@@ -586,13 +647,6 @@ def main(args):
         base_channels=64
     ).to(device)
     
-    if torch.distributed.is_initialized():
-        # Use DDP for discriminator instead of FSDP
-        discriminator = DistributedDataParallel(
-            discriminator,
-            device_ids=[local_rank],
-            output_device=local_rank
-        )
     
     # Move models to device
     generator = generator.to(device)
@@ -650,8 +704,8 @@ def main(args):
     train_dataloader, val_dataloader = create_vqa_dataloaders(args)
     
     # Let accelerator handle distribution
-    generator, optimizer_G, optimizer_W, train_dataloader, val_dataloader = accelerator.prepare(
-        generator, optimizer_G, optimizer_W, train_dataloader, val_dataloader
+    generator, discriminator, optimizer_G, optimizer_D, optimizer_W, train_dataloader, val_dataloader = accelerator.prepare(
+        generator, discriminator, optimizer_G, optimizer_D, optimizer_W, train_dataloader, val_dataloader
     )
 
     

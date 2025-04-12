@@ -755,10 +755,11 @@ def main(args):
                     generator.train()
                     if epoch < num_epochs_phase_1:
                         train_g_loss, train_q_loss = stage1_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator, phase=1)
-                        # Run validation every 5 epochs
-                        generator.eval()
-                        val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator, stage=1)
-                        logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Val loss: {val_loss:.4f}")
+                        # Run validation every 10 epochs
+                        if epoch % 10 == 0:
+                            generator.eval()
+                            val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator, stage=1)
+                            logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Val loss: {val_loss:.4f}")
                         scheduler_G.step()
                         # Log learning rate
                         if accelerator.is_main_process:
@@ -789,10 +790,11 @@ def main(args):
                             logger.info(f"Rank 0: Checkpoint saving completed")
                     else:
                         train_g_loss, train_a_loss, train_d_loss, train_q_loss = stage1_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator, phase=2)
-                        # Run validation every 5 epochs
-                        generator.eval()
-                        val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator, stage=1)
-                        logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Train A loss: {train_a_loss:.4f}, Train D loss: {train_d_loss:.4f}, Val loss: {val_loss:.4f}")
+                        # Run validation every 10 epochs
+                        if epoch % 10 == 0:
+                            generator.eval()
+                            val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator, stage=1)
+                            logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Train A loss: {train_a_loss:.4f}, Train D loss: {train_d_loss:.4f}, Val loss: {val_loss:.4f}")
                         scheduler_G.step()
                         scheduler_D.step()
                         # Log learning rate
@@ -839,10 +841,11 @@ def main(args):
                     train_g_loss = stage2_train(generator, discriminator, train_dataloader, optimizer_W, epoch, device, args, accelerator)
                         
                         
-                    # Run validation every 5 epochs
-                    generator.eval()
-                    val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator, stage=2)
-                    logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Val loss: {val_loss:.4f}")
+                    # Run validation every 10 epochs
+                    if epoch % 10 == 0:
+                        generator.eval()
+                        val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator, stage=2)
+                        logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Val loss: {val_loss:.4f}")
                     
                     scheduler_W.step()
                     

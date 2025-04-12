@@ -60,7 +60,7 @@ TRAIN_CMD="accelerate launch \
     --num_epochs_1 200 \
     --num_epochs_2 200 \
     --num_epochs_3 200 \
-    --start_epoch 100\
+    --start_epoch 0\
     --start_stage 1 \
     --textalign \
     --learning_rate_g 1e-4 \

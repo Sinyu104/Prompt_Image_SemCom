@@ -599,6 +599,7 @@ def main(args):
     
     # Load configuration from config.json
     config = ModelConfig.from_json("config.json")
+    config.override_with_args(args)
     print("Loaded Configuration:")
     
     # Get local rank for device placement

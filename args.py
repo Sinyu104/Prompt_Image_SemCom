@@ -87,6 +87,10 @@ def parse_args():
     parser.add_argument("--noise_power", type=float, default=None, help="Override noise power")
     parser.add_argument("--M", type=int, default=None, help="Override modulation order")
 
+    # --- Codebook Overrides (optional, overrides config.json if used) ---
+    parser.add_argument("--num_embeddings", type=int, default=None, help="Override number of codewords")
+    parser.add_argument("--embedding_dim", type=int, default=None, help="Override dimension of codewords")
+
     # --- Channel Parameter Overrides ---
     parser.add_argument("--num_clusters", type=int, default=None, help="Override number of channel clusters")
     parser.add_argument("--num_rays", type=int, default=None, help="Override number of rays per cluster")

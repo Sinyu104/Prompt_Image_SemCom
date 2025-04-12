@@ -28,15 +28,15 @@ class VisionConfig:
 
 @dataclass
 class PhysicalConfig:
-    Nt: int = 64
-    Nr: int = 64
-    NRF: int = 2
-    Ns: int = 2
-    num_subcarriers: int = 64
-    noise_power: float = 1.0
-    M: int = 8
-    num_clusters: int = 5
-    num_rays: int = 10
+    Nt: int 
+    Nr: int 
+    NRF: int 
+    Ns: int 
+    num_subcarriers: int 
+    noise_power: float
+    M: int
+    num_clusters: int
+    num_rays: int
 
 @dataclass
 class CodebookConfig:
@@ -112,6 +112,8 @@ class ModelConfig:
             # Route overrides to the correct sub-config
             if hasattr(self.physical_config, field):
                 setattr(self.physical_config, field, value)
+            elif hasattr(self.codebook_config, field):
+                setattr(self.codebook_config, field, value)
             elif hasattr(self, field):
                 setattr(self, field, value)
       

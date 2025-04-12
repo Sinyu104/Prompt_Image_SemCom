@@ -266,7 +266,7 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
                 # Train Discriminator only on even batch indices
                 optimizer_G.zero_grad()
                 with autocast():
-                    outputs = generator(batch['image'], batch['question'], stage=1)
+                    outputs = generator(batch['image'], batch['question'], batch['answer_text'], stage=1)
                     generated_images = outputs['generated_images']
                     generated_images = torch.clamp(generated_images, 0, 1)
         
@@ -332,7 +332,7 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
                 # Train Discriminator only on even batch indices
                 optimizer_G.zero_grad()
                 with autocast(enabled=False):
-                    outputs = generator(batch['image'], batch['question'], stage=1)
+                    outputs = generator(batch['image'], batch['question'], batch['answer_text'], stage=1)
                     generated_images = outputs['generated_images']
                     generated_images = torch.clamp(generated_images, 0, 1)
                     # Compute the critic (discriminator) score on fake images
@@ -475,7 +475,7 @@ def stage2_train(generator, discriminator, train_dataloader, optimizer, epoch, d
 
         with autocast():
             # Forward pass with stage=2 triggers weighting logic
-            outputs = generator(batch['image'], batch['question'], stage=2)
+            outputs = generator(batch['image'], batch['question'], batch['answer_text'], stage=2)
             generated_images = outputs['generated_images']
             generated_images = torch.clamp(generated_images, 0, 1)
 
@@ -546,7 +546,7 @@ def validate(generator, val_loader, epoch, device, args, accelerator, stage=1):
 
         for batch_idx, batch in enumerate(val_loader):
             with autocast():
-                outputs = generator(batch['image'], batch['question'], stage=stage)
+                outputs = generator(batch['image'], batch['question'], batch['answer_text'], stage=stage)
 
                 loss = (
                     args.loss_recon * outputs['loss_recon'] +

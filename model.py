@@ -1644,18 +1644,21 @@ class AnswerGenerationModel(nn.Module):
             param.requires_grad = False  # Freeze CLIP parameters
 
 
-    def forward(self, images, generated_images, questions):
+    def forward(self, images, generated_images, questions, answers):
         """Forward pass using CLIP for perceptual alignment"""
         # Ensure images and texts are lists
         if not isinstance(questions, list):
             questions = [questions]
+        if not isinstance(answers, list):
+            answers = [answers]
 
+        prompts = [f"Q: {q} A: {a}" for q, a in zip(questions, answers)]
         images = images.detach().clamp(0, 1).float()
         generated_images = generated_images.detach().clamp(0, 1).float()
 
         # Tokenize with text
-        inputs_real = self.processor(text=questions, images=images, return_tensors="pt", padding=True, do_rescale=False)
-        inputs_gen = self.processor(text=questions, images=generated_images, return_tensors="pt", padding=True, do_rescale=False)
+        inputs_real = self.processor(text=prompts, images=images, return_tensors="pt", padding=True, do_rescale=False)
+        inputs_gen = self.processor(text=prompts, images=generated_images, return_tensors="pt", padding=True, do_rescale=False)
 
         # Move inputs to device
         inputs_real = {k: v.to(self.device) for k, v in inputs_real.items()}
@@ -1755,7 +1758,7 @@ class VQAWithSegmentation(nn.Module):
         ])
         
         
-    def forward(self, images, questions, stage=None, textalign=True):
+    def forward(self, images, questions, answer, stage=None, textalign=True):
         # Process images and text separately
         image_inputs = self.processor.image_processor(
             images=images,
@@ -1792,7 +1795,7 @@ class VQAWithSegmentation(nn.Module):
         # 2. Perceptual Loss
         # --------------------
         # Add batch dimension for interpolation
-        perceptual_loss = self.perceptual_model(images, generated_images, questions)['loss_perc']
+        perceptual_loss = self.perceptual_model(images, generated_images, questions, answer)['loss_perc']
         
         # Add VGG perceptual loss
         vgg_loss = self.vgg_loss(generated_images, images)

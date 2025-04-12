@@ -1,195 +1,109 @@
+import json
 import os
+import logging
 import torch
-from torch.utils.data import Dataset
-from pycocotools.coco import COCO
 import numpy as np
 from PIL import Image
-import requests
-import torchvision.transforms as transforms
-from io import BytesIO
-import skimage.io as io
-import matplotlib.pyplot as plt
-import json
-from collections import Counter
 from torchvision import transforms
-import logging
-from typing import List, Dict
-from dataset_utils import ImageCategorizer, DatasetSplitter
 from tqdm import tqdm
 
-class COCOSegmentationDataset(Dataset):
-    def __init__(self, annotation_dir, split='train', transform=None):
-        """
-        Args:
-            root_dir (str): Root directory of COCO dataset containing image folders
-            annotation_dir (str): Directory containing annotation files
-            split (str): 'train' or 'val'
-            transform (callable, optional): Optional transform to be applied on images
-        """
-        is_main_process = int(os.environ.get("LOCAL_RANK", -1)) == 0
-        self.split = split
-        self.transform = transform if transform else transforms.ToTensor()
-        
-        # Set up file paths
-        caption_file = os.path.join(annotation_dir, f'captions_{split}2017.json')
-        instance_file = os.path.join(annotation_dir, f'instances_{split}2017.json')
-        
-        # Only load COCO on main process
-        if is_main_process:
-            self.coco_caps = COCO(caption_file)
-            self.coco_instances = COCO(instance_file)
-        
-        # Wait for main process to load
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-        
-        # Other processes can now use the loaded COCO data
-        if not is_main_process:
-            self.coco_caps = COCO(caption_file)
-            self.coco_instances = COCO(instance_file)
-        
-        # Get all image IDs that have both captions and instance annotations
-        self.image_ids = list(set(self.coco_caps.getImgIds()) & 
-                            set(self.coco_instances.getImgIds()))
-        
-        # Pre-fetch category names
-        self.categories = {cat['id']: cat['name'] 
-                         for cat in self.coco_instances.loadCats(
-                             self.coco_instances.getCatIds())}
-
-    def __len__(self):
-        return len(self.image_ids)
-
-    def get_captions(self, img_id):
-        """Get all captions for an image."""
-        ann_ids = self.coco_caps.getAnnIds(imgIds=img_id)
-        anns = self.coco_caps.loadAnns(ann_ids)
-        return [ann['caption'] for ann in anns]
-
-    def get_instance_masks(self, img_id, img_size):
-        """Get instance segmentation masks for an image."""
-        ann_ids = self.coco_instances.getAnnIds(imgIds=img_id)
-        anns = self.coco_instances.loadAnns(ann_ids)
-        
-        # Initialize empty mask
-        masks = []
-        categories = []
-        
-        for ann in anns:
-            mask = self.coco_instances.annToMask(ann)
-            category = self.categories[ann['category_id']]
-            
-            # Resize mask to match image size if necessary
-            if mask.shape != img_size:
-                mask = Image.fromarray(mask)
-                mask = mask.resize((img_size[1], img_size[0]), Image.NEAREST)
-                mask = np.array(mask)
-            
-            masks.append(mask)
-            categories.append(category)
-        
-        return masks, categories
-
-    def load_image_from_url(self, url):
-        """Load image from URL."""
-        try:
-            response = requests.get(url)
-            image = Image.open(BytesIO(response.content)).convert('RGB')
-            return image
-        except Exception as e:
-            print(f"Error loading image from URL: {e}")
-            return None
-
-    def __getitem__(self, idx):
-        """
-        Returns:
-            dict: {
-                'image': tensor of shape [3, H, W],
-                'masks': list of binary masks,
-                'categories': list of category names,
-                'captions': list of caption strings,
-                'image_id': COCO image ID
-            }
-        """
-        img_id = self.image_ids[idx]
-        
-        # Load image
-        img_info = self.coco_caps.loadImgs(img_id)[0]
-        image = self.load_image_from_url(img_info['coco_url'])
-       
-        
-        if image is None:
-            # Return None or skip this sample if image loading fails
-            return None
-        
-        # Get image size for mask generation
-        img_size = image.size[::-1]  # (H, W)
-        
-        # Apply transforms to image
-        image = self.transform(image)
-        
-        # Get captions
-        captions = self.get_captions(img_id)
-        
-        # Get instance masks and categories
-        masks, categories = self.get_instance_masks(img_id, img_size)
-        
-        # Convert masks to tensor
-        if masks:
-            masks = torch.tensor(np.stack(masks))
+###############################################################################
+# Helper to Generate Split Configurations
+###############################################################################
+def get_split_configs(train_category: str, val_category: str):
+    """
+    Given the train_category and val_category strings, return configuration dictionaries
+    for training and validation filtering.
+    Allowed pairs:
+      - ("nonanimal", "animal")
+      - ("nonhuman", "human")
+      - ("outdoor", "indoor")
+      - ("indoor", "outdoor")
+      
+    The 'non' prefix indicates filtering out images containing that category.
+    """
+    allowed_pairs = [
+        ("nonanimal", "animal"),
+        ("nonhuman", "human"),
+        ("outdoor", "indoor"),
+        ("indoor", "outdoor")
+    ]
+    if (train_category, val_category) not in allowed_pairs:
+        raise ValueError(f"Allowed split pairs: {allowed_pairs}. Provided: {(train_category, val_category)}")
+    
+    def make_config(cat: str):
+        if cat.startswith("non"):
+            # Remove "non" prefix and set negation flag
+            return {"category": cat[3:].lower(), "negation": True}
         else:
-            masks = torch.zeros((0, img_size[0], img_size[1]))
+            return {"category": cat.lower(), "negation": False}
+    
+    return make_config(train_category), make_config(val_category)
+
+###############################################################################
+# Image Categorizer with Category Mapping
+###############################################################################
+class ImageCategorizer:
+    def __init__(self, instances_file):
+        """
+        Load the instances file (e.g. in COCO format) and build a mapping from image_id to the 
+        set of object category names present in that image.
+        """
+        with open(instances_file, 'r') as f:
+            instances = json.load(f)
         
-        return {
-            'image': image,
-            'masks': masks,
-            'categories': categories,
-            'captions': captions,
-            'image_id': img_id
+        # Define broad category mapping (all strings should be lowercase)
+        self.category_mapping = {
+            'animal': [
+                'dog', 'cat', 'bird', 'horse', 'sheep', 'cow', 'elephant', 'bear', 
+                'zebra', 'giraffe'
+            ],
+            'human': [
+                'person', 'people', 'man', 'woman', 'child', 'baby', 'guy', 'girl', 'boy'
+            ],
+            'indoor': [
+                'couch', 'bed', 'toilet', 'tv', 'mouse', 'keyboard', 'remote', 
+                'cell phone', 'microwave', 'oven', 'refrigerator', 'sink', 'toaster',
+                'laptop', 'computer', 'chair', 'table', 'sofa', 'desk'
+            ],
+            'outdoor': [
+                'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 
+                'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter'
+            ]
         }
-
-def get_coco_dataloader(annotation_dir, split='train', 
-                       batch_size=1, num_workers=4, shuffle=True):
-    """
-    Create a DataLoader for the COCO dataset.
+        
+        # Build mapping from image_id to set of category names (all lowercase)
+        self.image_categories = {}
+        cat_id_to_name = {}
+        if 'categories' in instances:
+            for cat in instances['categories']:
+                cat_id_to_name[cat['id']] = cat['name'].lower()
+        
+        if 'annotations' in instances:
+            for ann in instances['annotations']:
+                image_id = ann['image_id']
+                category_id = ann.get('category_id')
+                if category_id is not None:
+                    cat_name = cat_id_to_name.get(category_id, "")
+                    if image_id not in self.image_categories:
+                        self.image_categories[image_id] = set()
+                    self.image_categories[image_id].add(cat_name)
     
-    Args:
-        root_dir (str): Root directory of COCO dataset
-        annotation_dir (str): Directory containing annotation files
-        split (str): 'train' or 'val'
-        batch_size (int): Batch size
-        num_workers (int): Number of workers for data loading
-        shuffle (bool): Whether to shuffle the dataset
-    """
-    # Define transforms
-    transform = transforms.Compose([
-        transforms.Resize((352, 352)),  # Resize to fixed size
-        transforms.ToTensor(),
-    ])
     
-    # Create dataset
-    dataset = COCOSegmentationDataset(
-        annotation_dir=annotation_dir,
-        split=split,
-        transform=transform
-    )
+    def matches_config(self, image_id, config: dict):
+        """
+        Check if the image (by image_id) meets the filtering criteria.
+        """
+        specific_classes = set(self.category_mapping.get(config["category"], []))
+        image_cats = self.image_categories.get(image_id, set())
+        has_match = bool(image_cats.intersection(specific_classes))
+        return not has_match if config["negation"] else has_match
 
-    
-    # Create dataloader
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        collate_fn=collate_fn
-    )
-    
-    return dataloader
-
-
-class VQAv2Dataset(Dataset):
-    def __init__(self, questions_file, annotations_file, image_dir, instances_file, processor, split='train', 
-                 split_config: Dict = None):
+###############################################################################
+# VQAv2Dataset with Updated Filtering Logic
+###############################################################################
+class VQAv2Dataset(torch.utils.data.Dataset):
+    def __init__(self, questions_file, annotations_file, image_dir, instances_file, processor, split='train', split_config=None):
         super().__init__()
         
         logger = logging.getLogger('training')
@@ -198,35 +112,25 @@ class VQAv2Dataset(Dataset):
         self.split = split
         self.processor = processor
         self.image_dir = image_dir
-        self.splitter = DatasetSplitter()
-        self.cache_dir = os.path.join(os.path.dirname(questions_file), "split_cache")
         
-        # Load questions and annotations only on main process first
+        # The cache directory is based on the directory of the questions file.
+        self.cache_dir = os.path.join(os.path.dirname(questions_file), "split_cache")
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir)
+        
+        # Load questions and annotations (only main process loads first in distributed training)
+        logger = logging.getLogger('training')
+        is_main_process = int(os.environ.get("LOCAL_RANK", -1)) == 0
+        
         if is_main_process:
             logger.info(f"Loading {split} dataset...")
-            if split_config:
-                logger.info(f"Using split config: {split_config}")
-            else:
-                logger.info("Using full dataset (no splitting)")
-            
-            # Create cache directory if it doesn't exist
-            if not os.path.exists(self.cache_dir):
-                os.makedirs(self.cache_dir)
-            
-            # Load questions and annotations
             with open(questions_file, 'r') as f:
                 self.questions = json.load(f)
             with open(annotations_file, 'r') as f:
                 self.annotations = json.load(f)['annotations']
-                
-            # Initialize categorizer
             self.categorizer = ImageCategorizer(instances_file)
-        
-        # Wait for main process to load
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
-        
-        # Other processes load after main process is done
         if not is_main_process:
             with open(questions_file, 'r') as f:
                 self.questions = json.load(f)
@@ -234,147 +138,140 @@ class VQAv2Dataset(Dataset):
                 self.annotations = json.load(f)['annotations']
             self.categorizer = ImageCategorizer(instances_file)
         
-        # Apply splitting if config is provided
-        if split_config:
-            self.load_or_create_split(split_config, questions_file, annotations_file)
-            
-        if is_main_process:
-            logger.info(f"Loaded {len(self.questions['questions'])} questions")
-
-    def get_cache_path(self, split_config: Dict) -> str:
-        """Generate cache file path based on split configuration"""
-        cache_name = f"{self.split}_{split_config['split_type']}_{split_config['level2']}_{split_config['category']}.json"
-        return os.path.join(self.cache_dir, cache_name)
-    
-    def load_or_create_split(self, split_config: Dict, questions_file: str, annotations_file: str):
-        """Load split dataset from cache or create and cache it"""
-        cache_path = self.get_cache_path(split_config)
-        is_main_process = int(os.environ.get("LOCAL_RANK", -1)) == 0
-        logger = logging.getLogger('training')
+        # If a split configuration is provided, load or create the split.
+        if split_config is not None:
+            self.load_or_create_split(split_config)
+        else:
+            # No filtering configuration provided, so perform random subsampling.
+            # This branch is used when train_category and val_category are None.
+            max_samples = 20000 if self.split == 'train' else 2000
+            total_questions = len(self.questions['questions'])
+            if total_questions > max_samples:
+                # Distributed handling: only main process selects indices,
+                # then the indices are broadcasted to all other processes.
+                device = torch.device(f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}')
+                if is_main_process:
+                    indices = list(np.random.choice(total_questions, max_samples, replace=False))
+                else:
+                    indices = None
+                if torch.distributed.is_initialized():
+                    if is_main_process:
+                        num_indices = torch.tensor(len(indices), dtype=torch.long, device=device)
+                    else:
+                        num_indices = torch.tensor(0, dtype=torch.long, device=device)
+                    torch.distributed.broadcast(num_indices, src=0)
+                    if is_main_process:
+                        indices_tensor = torch.tensor(indices, dtype=torch.long, device=device)
+                    else:
+                        indices_tensor = torch.zeros(num_indices.item(), dtype=torch.long, device=device)
+                    torch.distributed.broadcast(indices_tensor, src=0)
+                    indices = indices_tensor.cpu().tolist()
+                # Subsample the questions and annotations.
+                self.questions['questions'] = [self.questions['questions'][i] for i in indices]
+                if self.annotations:
+                    self.annotations = [self.annotations[i] for i in indices]
         
-        # Try to load from cache
+        logger.info(f"Loaded {len(self.questions['questions'])} questions for split: {split}")
+    
+    def get_cache_path(self, split_config: dict) -> str:
+        """
+        Generate a cache file path based on the split configuration.
+        For example, for split 'train' and config {'category': 'animal', 'negation': True},
+        a possible name is 'train_animal_neg.json'.
+        """
+        suffix = "neg" if split_config["negation"] else "pos"
+        cache_name = f"{self.split}_{split_config['category']}_{suffix}.json"
+        return os.path.join(self.cache_dir, cache_name)
+
+    def load_or_create_split(self, split_config: dict):
+        """
+        Load the filtered (split) dataset from cache if available.
+        Otherwise, filter the dataset and save the result to the cache.
+        """
+        cache_path = self.get_cache_path(split_config)
+        logger = logging.getLogger('training')
+        is_main_process = int(os.environ.get("LOCAL_RANK", -1)) == 0
+        
         if os.path.exists(cache_path):
             if is_main_process:
                 logger.info(f"Loading split dataset from cache: {cache_path}")
             try:
                 with open(cache_path, 'r') as f:
-                    cached_data = json.load(f)
-                    self.questions['questions'] = cached_data['questions']
-                    self.annotations = cached_data['annotations']
-                    # Convert criteria back to set if loading from cache
-                    if 'split_config' in cached_data and 'criteria' in cached_data['split_config']:
-                        cached_data['split_config']['criteria'] = set(cached_data['split_config']['criteria'])
+                    cache_data = json.load(f)
+                    # Update the questions and annotations from the cached split.
+                    self.questions['questions'] = cache_data['questions']
+                    self.annotations = cache_data['annotations']
                 return
             except (json.JSONDecodeError, OSError) as e:
                 if is_main_process:
-                    logger.warning(f"Failed to load cache file {cache_path}: {e}")
-                    # Delete corrupted cache file
-                    try:
-                        os.remove(cache_path)
-                    except OSError:
-                        pass
-        
-        # If not cached, create split
-        if is_main_process:
-            logger.info("Split dataset not found in cache, creating new split...")
-        
-        # Filter dataset
+                    logger.warning(f"Failed to load cache file {cache_path}: {e}. Recreating split...")
+                try:
+                    os.remove(cache_path)
+                except OSError:
+                    pass
+
+        # If cache does not exist, filter the dataset and then save.
         self.filter_dataset(split_config)
-        
-        # Save to cache if main process
         if is_main_process:
-            # Convert sets to lists in split_config for JSON serialization
-            json_safe_config = split_config.copy()
-            if 'criteria' in json_safe_config:
-                json_safe_config['criteria'] = list(json_safe_config['criteria'])
-            
+            logger.info(f"Saving split dataset to cache: {cache_path}")
             cache_data = {
                 'questions': self.questions['questions'],
                 'annotations': self.annotations,
-                'split_config': json_safe_config
+                'split_config': split_config
             }
+            temp_path = cache_path + '.tmp'
             try:
-                # Write to temporary file first
-                temp_path = cache_path + '.tmp'
                 with open(temp_path, 'w') as f:
                     json.dump(cache_data, f)
-                # Then rename to final path (atomic operation)
                 os.replace(temp_path, cache_path)
-                logger.info(f"Saved split dataset to cache: {cache_path}")
             except Exception as e:
                 logger.error(f"Failed to save cache file: {e}")
-                # Clean up temp file if it exists
                 try:
                     os.remove(temp_path)
                 except OSError:
                     pass
 
     def filter_dataset(self, split_config):
-        """Filter dataset based on the provided split configuration"""
         is_main_process = int(os.environ.get("LOCAL_RANK", -1)) == 0
         device = torch.device(f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}')
         
         filtered_indices = []
         max_samples = 20000 if self.split == 'train' else 2000
         
-        # Only main process does the filtering
         if is_main_process:
-            # Get total number of questions
             total_questions = len(self.questions['questions'])
-            
-            # Create progress bar
             pbar = tqdm(total=total_questions, 
-                      desc=f"Filtering {self.split} dataset (max {max_samples}) for {split_config['category']} category")
-            
+                        desc=f"Filtering {self.split} dataset for {split_config['category']} (negation={split_config['negation']})")
             for idx, question in enumerate(self.questions['questions']):
                 image_id = question['image_id']
-                answer = self.annotations[idx]['multiple_choice_answer']
-                matches = self.categorizer.categorize_sample(
-                    image_id,
-                    question['question'],
-                    answer,
-                    split_config['criteria']
-                )
-                
-                if not matches:
+                if not self.categorizer.matches_config(image_id, split_config):
                     pbar.update(1)
                     continue
-                
                 filtered_indices.append(idx)
                 pbar.update(1)
-            
             pbar.close()
             
-            # Randomly sample if we have more than max_samples
             if len(filtered_indices) > max_samples:
                 filtered_indices = list(np.random.choice(filtered_indices, max_samples, replace=False))
-
-        # Broadcast filtered indices from main process to all processes
+        
         if torch.distributed.is_initialized():
-            # First broadcast the number of indices
             if is_main_process:
                 num_indices = torch.tensor(len(filtered_indices), dtype=torch.long, device=device)
             else:
                 num_indices = torch.tensor(0, dtype=torch.long, device=device)
             torch.distributed.broadcast(num_indices, src=0)
-            
-            # Convert to tensor for broadcasting
             if is_main_process:
                 indices_tensor = torch.tensor(filtered_indices, dtype=torch.long, device=device)
             else:
                 indices_tensor = torch.zeros(num_indices.item(), dtype=torch.long, device=device)
-            
-            # Broadcast from rank 0 to all processes
             torch.distributed.broadcast(indices_tensor, src=0)
             filtered_indices = indices_tensor.cpu().tolist()
         
-        # Update questions and annotations
         self.questions['questions'] = [self.questions['questions'][i] for i in filtered_indices]
         if self.annotations:
             self.annotations = [self.annotations[i] for i in filtered_indices]
 
     def get_answer(self, idx):
-        """Get answer for a given question index"""
         if self.annotations:
             return self.annotations[idx]['multiple_choice_answer']
         return None
@@ -383,43 +280,37 @@ class VQAv2Dataset(Dataset):
         return len(self.questions['questions'])
     
     def __getitem__(self, idx):
-        # Get question data
         question_data = self.questions['questions'][idx]
         image_id = question_data['image_id']
         question = question_data['question']
         
-        # Load and preprocess image
         image_path = os.path.join(
             self.image_dir,
             f'COCO_{self.split}2014_{str(image_id).zfill(12)}.jpg'
         )
         image = Image.open(image_path).convert('RGB')
-        
-        # Apply transforms (assuming 'processor' includes ToTensor)
         image = self.processor(image)
         
-        # Get answer if available
         answer = self.get_answer(idx) if self.annotations else None
         
         return {
-            'image': image,  # Already a tensor scaled to [0,1]
+            'image': image,
             'question': question,
             'answer_text': answer,
             'image_id': image_id,
-            'target_mask': torch.zeros((352, 352))  # Placeholder mask
         }
-
-    def get_captions(self, image_id: int) -> List[str]:
-        """Get captions for an image from annotations"""
-        # For VQA-v2, we'll use the question as a caption since we don't have direct access to COCO captions
+    
+    def get_captions(self, image_id: int):
         captions = []
         for q in self.questions['questions']:
             if q['image_id'] == image_id:
                 captions.append(q['question'])
         return captions
 
+###############################################################################
+# DataLoader Creation with New Split Options
+###############################################################################
 def create_vqa_dataloaders(args):
-    """Create DataLoader for the VQA dataset."""
     logger = logging.getLogger('training')
     is_main_process = int(os.environ.get("LOCAL_RANK", -1)) == 0
     
@@ -428,18 +319,14 @@ def create_vqa_dataloaders(args):
         transforms.ToTensor(),
     ])
     
-    # Create split config for all processes
-    split_config = None
-    if all([args.split_type, args.split_level2, args.train_category, args.val_category]):
-        splitter = DatasetSplitter()
-        split_config = splitter.get_split_config(
-            args.split_type,
-            args.split_level2,
-            args.train_category,
-            args.val_category
-        )
+    # If both categories are "None", then use the full dataset without filtering.
+    if args.train_category != "None" and args.val_category != "None":
+        train_config, val_config = get_split_configs(args.train_category, args.val_category)
+        logger.info(f"Train config: {train_config} - Val config: {val_config}")
+    else:
+        logger.info("No filtering will be applied; using full dataset.")
+        train_config, val_config = None, None
     
-    # Create datasets on all processes
     train_dataset = VQAv2Dataset(
         questions_file=os.path.join(args.data_dir, "v2_OpenEnded_mscoco_train2014_questions.json"),
         annotations_file=os.path.join(args.data_dir, "v2_mscoco_train2014_annotations.json"),
@@ -447,7 +334,7 @@ def create_vqa_dataloaders(args):
         instances_file=os.path.join(args.data_dir, "instances_train2014.json"),
         processor=transform,
         split='train',
-        split_config=split_config.get('train') if split_config else None
+        split_config=train_config
     )
     
     val_dataset = VQAv2Dataset(
@@ -457,15 +344,14 @@ def create_vqa_dataloaders(args):
         instances_file=os.path.join(args.data_dir, "instances_val2014.json"),
         processor=transform,
         split='val',
-        split_config=split_config.get('val') if split_config else None
+        split_config=val_config
     )
-
-    # Create dataloaders
+    
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,  # More workers per GPU
+        num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=True,
         collate_fn=collate_fn
@@ -475,7 +361,7 @@ def create_vqa_dataloaders(args):
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,  # Also increase val workers
+        num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=True,
         collate_fn=collate_fn
@@ -483,21 +369,16 @@ def create_vqa_dataloaders(args):
     
     return train_dataloader, val_dataloader
 
+
 def collate_fn(batch):
-    """
-    Custom collate function for the dataloader
-    """
-    # Collect all items from batch
     images = torch.stack([item['image'] for item in batch])
     questions = [item['question'] for item in batch]
     answers = [item['answer_text'] for item in batch]
     image_ids = [item['image_id'] for item in batch]
-    target_masks = torch.stack([item['target_mask'] for item in batch])
     
     return {
         'image': images,
         'question': questions,
         'answer_text': answers,
         'image_id': image_ids,
-        'target_mask': target_masks
     }

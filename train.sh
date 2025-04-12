@@ -22,11 +22,10 @@ export OMP_NUM_THREADS=8  # Parallel operations
 export MKL_NUM_THREADS=8  # Intel MKL parallelism
 export NUMEXPR_NUM_THREADS=8  # NumExpr parallelism
 
-export TORCH_USE_CUDA_DSA=1
 
 
 # Set initial batch size (will be divided by number of GPUs)
-TOTAL_BATCH_SIZE=4  # Further reduce batch size
+TOTAL_BATCH_SIZE=16  # Further reduce batch size
 NUM_GPUS=4
 PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
@@ -34,7 +33,7 @@ PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
 OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
 # OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_20250409_191851"
-RESUME_DIR="$HOME/prompt_image_segment/outputs/stage1_phase2_20250404_000529/checkpoints/checkpoint_epoch_70_loss_1.4366.pth"
+RESUME_DIR="$HOME/prompt_image_segment/outputs/stage1_phase1_user_aligned_20250410_145200/checkpoints/checkpoint_epoch_102_loss_1.8149.pth"
 # RESUME_DIR=None
 STORE_DIR="$HOME/prompt_image_segment/stored_data/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
 
@@ -73,18 +72,16 @@ TRAIN_CMD="accelerate launch \
     --lambda_sparsity 0.0 \
     --lambda_smoothness 0.0 \
     --lambda_answer 0.0 \
-    --loss_recon 1.0 \
-    --loss_perc 2.0 \
-    --loss_vgg 2.0 \
+    --loss_recon 0.0 \
+    --loss_perc 5.0 \
+    --loss_vgg 7.0 \
     --loss_quant 0.1 \
     --loss_gen 1.0 \
     --loss_disc 0.5 \
     --log_interval 200 \
     --sample_interval 100 \
-    --split_type image_based \
-    --split_level2 subject \
-    --train_category animal \
-    --val_category human \
+    --train_category None \
+    --val_category None \
     --resume_from_checkpoint $RESUME_DIR\
     --generated_data_dir $STORE_DIR"
 

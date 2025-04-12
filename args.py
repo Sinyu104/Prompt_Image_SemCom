@@ -72,16 +72,11 @@ def parse_args():
                        help='Interval for visualization')
     
     # Dataset splitting arguments (all optional)
-    parser.add_argument('--split_type', type=str,
-                       choices=['image_based', 'question_based'],
-                       help='First level split type (optional)', default=None)
-    parser.add_argument('--split_level2', type=str,
-                       choices=['scene', 'subject', 'reasoning', 'type'],
-                       help='Second level split category (optional)', default=None)
-    parser.add_argument('--train_category', type=str,
-                       help='Category to use for training (optional)', default=None)
-    parser.add_argument('--val_category', type=str,
-                       help='Category to use for validation (optional)', default=None)
+    parser.add_argument('--train_category', type=str, choices=['nonanimal', 'nonhuman', 'indoor', 'outdoor', 'None'],
+                        help='Category to use for training. Must be one of: nonanimal, nonhuman, indoor, outdoor')
+    parser.add_argument('--val_category', type=str, choices=['animal', 'human', 'indoor', 'outdoor', 'None'],
+                        help='Category to use for validation. Must be one of: animal, human, indoor, outdoor')
+
 
     # --- Physical Layer Overrides (optional, overrides config.json if used) ---
     parser.add_argument("--Nt", type=int, default=None, help="Override number of transmit antennas")

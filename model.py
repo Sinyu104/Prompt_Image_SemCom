@@ -1742,10 +1742,10 @@ class VQAWithSegmentation(nn.Module):
         
         # Initialize models
         self.image_generation_model = TextOrientedImageGeneration(config=config, device=self.device)
-        # self.perceptual_model = AnswerGenerationModel(
-        #     model_name='openai/clip-vit-base-patch16',
-        #     device=self.device
-        # )
+        self.perceptual_model = AnswerGenerationModel(
+            model_name='openai/clip-vit-base-patch16',
+            device=self.device
+        )
 
         # Reconstruction Loss (e.g., L1 Loss)
         self.recon_loss = nn.L1Loss()
@@ -1792,7 +1792,7 @@ class VQAWithSegmentation(nn.Module):
         # 2. Perceptual Loss
         # --------------------
         # Add batch dimension for interpolation
-        # perceptual_loss = self.perceptual_model(images, generated_images, questions)['loss_perc']
+        perceptual_loss = self.perceptual_model(images, generated_images, questions)['loss_perc']
         
         # Add VGG perceptual loss
         vgg_loss = self.vgg_loss(generated_images, images)
@@ -1800,7 +1800,7 @@ class VQAWithSegmentation(nn.Module):
         return {
             'generated_images': outputs.logits,
             'loss_recon': recon_loss,
-            'loss_perc': 0.0,
+            'loss_perc': perceptual_loss,
             'loss_vgg': vgg_loss,
             'quantization_loss': quantization_loss,
         }
@@ -1826,26 +1826,26 @@ class PatchGANDiscriminator(nn.Module):
         super().__init__()
         self.model = nn.Sequential(
             # First layer: no normalization, stride=2 reduces resolution.
-            nn.Conv2d(in_channels, base_channels, kernel_size=4, stride=2, padding=1),
+            spectral_norm(nn.Conv2d(in_channels, base_channels, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
             
             # Second layer: increase channels, stride=2.
-            nn.Conv2d(base_channels, base_channels * 2, kernel_size=4, stride=2, padding=1),
-            nn.InstanceNorm2d(base_channels * 2, track_running_stats=False, affine=True),
+            spectral_norm(nn.Conv2d(base_channels, base_channels * 2, kernel_size=4, stride=2, padding=1)),
+            nn.InstanceNorm2d(base_channels * 2),
             nn.LeakyReLU(0.2, inplace=True),
             
             # Third layer: increase channels, stride=2.
-            nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=4, stride=2, padding=1),
-            nn.InstanceNorm2d(base_channels * 4, track_running_stats=False, affine=True),
+            spectral_norm(nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=4, stride=2, padding=1)),
+            nn.InstanceNorm2d(base_channels * 4),
             nn.LeakyReLU(0.2, inplace=True),
             
             # Fourth layer: use stride=1 to capture local details.
-            nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size=4, stride=1, padding=1),
-            nn.InstanceNorm2d(base_channels * 8, track_running_stats=False,affine=True),
+            spectral_norm(nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size=4, stride=1, padding=1)),
+            nn.InstanceNorm2d(base_channels * 8),
             nn.LeakyReLU(0.2, inplace=True),
             
             # Final output layer: output a 1-channel prediction map.
-            nn.Conv2d(base_channels * 8, 1, kernel_size=4, stride=1, padding=1)
+            spectral_norm(nn.Conv2d(base_channels * 8, 1, kernel_size=4, stride=1, padding=1))
         )
         self.apply(self._init_weights)  # Apply weight initialization
         

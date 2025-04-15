@@ -11,7 +11,7 @@ from pymanopt.function import pytorch
 from pymanopt.manifolds import Euclidean
 
 class GeometryBasedChannel(nn.Module):
-    def __init__(self, Nt, Nr, NC, NR, device, subcarriers=1, wavelength=2.0, noise_power=1):
+    def __init__(self, Nt, Nr, NC, NR, device, subcarriers=1, wavelength=2.0, noise_power=1, siso=False):
         super().__init__()
         self.Nt = Nt
         self.Nr = Nr
@@ -20,7 +20,8 @@ class GeometryBasedChannel(nn.Module):
         self.K = subcarriers
         self.wavelength = wavelength
         self.noise_power = noise_power
-
+        self.siso=siso
+        print("noise: ", self.noise_power)
         self.total_paths = NC * NR
         self.d = 0.5 * wavelength
 
@@ -35,33 +36,36 @@ class GeometryBasedChannel(nn.Module):
         return (1 / math.sqrt(N)) * torch.exp(1j * n * phase_shifts)
 
     def _build_channel(self, device):
-
-        if device is None:
-            device = self.device if hasattr(self, "device") else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        P = self.total_paths
-        K = self.K
-        H_all = []
-
-        alpha = (torch.randn(P, device=device) + 1j * torch.randn(P, device=device)) / math.sqrt(2)
-        psi = torch.rand(self.NC, device=device)
-        psi_full = psi.repeat_interleave(self.NR)
-
-        phi_t = (torch.rand(P, device=device) - 0.5) * math.pi
-        phi_r = (torch.rand(P, device=device) - 0.5) * math.pi
-
-        A_t = self.array_response(self.Nt, phi_t)
-        A_r = self.array_response(self.Nr, phi_r)
-
-        H_b = []
-        for k in range(K):
-            theta_k = 2 * math.pi * psi_full * k / K
-            alpha_k = alpha * torch.exp(-1j * theta_k)
-            H_k = A_r @ torch.diag(alpha_k) @ A_t.conj().transpose(0, 1)
-            scaling = math.sqrt(self.Nt * self.Nr / P)
-            H_b.append(scaling * H_k)
+        if self.siso:
+            return (torch.randn(1, device=device) + 1j * torch.randn(1, device=device)) / math.sqrt(2)
         
-        return torch.stack(H_b, dim=0)  # [K, Nr, Nt]
+        else:
+            if device is None:
+                device = self.device if hasattr(self, "device") else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            P = self.total_paths
+            K = self.K
+            H_all = []
+
+            alpha = (torch.randn(P, device=device) + 1j * torch.randn(P, device=device)) / math.sqrt(2)
+            psi = torch.rand(self.NC, device=device)
+            psi_full = psi.repeat_interleave(self.NR)
+
+            phi_t = (torch.rand(P, device=device) - 0.5) * math.pi
+            phi_r = (torch.rand(P, device=device) - 0.5) * math.pi
+
+            A_t = self.array_response(self.Nt, phi_t)
+            A_r = self.array_response(self.Nr, phi_r)
+
+            H_b = []
+            for k in range(K):
+                theta_k = 2 * math.pi * psi_full * k / K
+                alpha_k = alpha * torch.exp(-1j * theta_k)
+                H_k = A_r @ torch.diag(alpha_k) @ A_t.conj().transpose(0, 1)
+                scaling = math.sqrt(self.Nt * self.Nr / P)
+                H_b.append(scaling * H_k)
+            
+            return torch.stack(H_b, dim=0)  # [K, Nr, Nt]
     def get_channel(self):
         """
         Get the current channel realization.
@@ -82,14 +86,19 @@ class GeometryBasedChannel(nn.Module):
         Returns:
             Y: [K, Nr] → received signal
         """
-        K, Nt, _ = X.shape
-        assert K == self.K and Nt == self.Nt
+        if self.siso:
+            Y = self.H*X
+            noise = (torch.randn_like(Y) + 1j * torch.randn_like(Y)) * math.sqrt(self.noise_power / 2)
+            return self.H*X+noise
+        else:
+            K, Nt, _ = X.shape
+            assert K == self.K and Nt == self.Nt
 
-        Y = torch.matmul(self.H, X).squeeze(-1)  # [K, Nr]
+            Y = torch.matmul(self.H, X).squeeze(-1)  # [K, Nr]
 
-        # Add complex AWGN
-        noise = (torch.randn_like(Y) + 1j * torch.randn_like(Y)) * math.sqrt(self.noise_power / 2)
-        return Y+noise  # [K, Nr]
+            # Add complex AWGN
+            noise = (torch.randn_like(Y) + 1j * torch.randn_like(Y)) * math.sqrt(self.noise_power / 2)
+            return Y+noise  # [K, Nr]
 
     
 class MAryModulation(nn.Module):
@@ -242,7 +251,6 @@ class HybridPrecoderModule(nn.Module):
         V_k* = (w * H_k^H Q_k Q_k^H H_k + noise_var I)^{-1} (w * H_k^H Q_k)
         """
         Va = self.get_analog_precoder()                       # [Nt, NRF]
-        P = 1
         # 1. Form the effective channel: H_eff = H_k * Va, shape: [Nr, NRF]
         H_eff = Q_k.conj().T @ H_k @ Va  # shape: [Ns, NRF]
 
@@ -423,7 +431,14 @@ class PhysicalLayerModule(nn.Module):
         self.NRF = config.NRF
         self.Ns = config.Ns
         self.num_subcarriers = config.num_subcarriers
-        self.noise_power = config.noise_power  # scalar noise power
+        self.snr = config.SNR  # scalar noise power
+        self.siso = config.SISO
+
+        self.power = 1.0
+
+        self.noise_power = self.power/ (10 ** (self.snr / 10))
+        print("noise_power: ", self.noise_power)
+        print("siso: ", self.siso)
         
         # Channel parameters (for a geometry-based channel simulation)
         self.num_clusters = config.num_clusters
@@ -437,7 +452,7 @@ class PhysicalLayerModule(nn.Module):
         self.combiner = HybridCombinerModule(self.Nr, self.NRF, self.Ns, self.num_subcarriers)
 
         # Initialize geometry-based channel model
-        self.channel = GeometryBasedChannel(self.Nt, self.Nr, self.num_clusters, self.num_rays, device=device, subcarriers=self.num_subcarriers, noise_power=self.noise_power)
+        self.channel = GeometryBasedChannel(self.Nt, self.Nr, self.num_clusters, self.num_rays, device=device, subcarriers=self.num_subcarriers, noise_power=self.noise_power, siso=self.siso)
 
     def reshape_modulated_symbols_to_grid(self, modulated_symbols):
         """
@@ -470,38 +485,49 @@ class PhysicalLayerModule(nn.Module):
         """
         Forward pass through hybrid precoding, MIMO-OFDM channel, and combining.
         """
-        modulated_symbols = self.mary_modulation.modulate(symbols)  # [L, B, len, group, 2] complex
-        modulated_grid = self.reshape_modulated_symbols_to_grid(modulated_symbols)  # [T, K, Ns]
-        T, K, Ns = modulated_grid.shape
-        assert K == self.num_subcarriers
-        output_sequence = []
-        self.channel.update_channel()      # update channel for current time step
-        H = self.channel.get_channel()     # [K, Nr, Nt]
-        for t in range(T): 
-            s_t = modulated_grid[t]            # [K, Ns]
-            weight_t = weight[t]
-            s_t = s_t.unsqueeze(-1)            # [K, Ns, 1]
-            self.wmmse_hybrid_beamforming(H, weight_t, noise_var=self.noise_power)   # Perform WMMSE optimization (updates precoder and combiner in-place)
+        if self.siso:
+            self.channel.update_channel()
+            H = self.channel.get_channel()
+            modulated_symbols = self.mary_modulation.modulate(symbols) # [L, B, len, group, 2] complex
+            transmitted_symbols = modulated_symbols.flatten()
+
+            received_symbols = self.channel(transmitted_symbols)/ H
+            received_symbols = received_symbols.reshape(modulated_symbols.shape)
+            demodulate_symbol = self.mary_modulation.demodulate(received_symbols)
+
+        else:
+            modulated_symbols = self.mary_modulation.modulate(symbols)  # [L, B, len, group, 2] complex
+            modulated_grid = self.reshape_modulated_symbols_to_grid(modulated_symbols)  # [T, K, Ns]
+            T, K, Ns = modulated_grid.shape
+            assert K == self.num_subcarriers
+            output_sequence = []
+            self.channel.update_channel()      # update channel for current time step
+            H = self.channel.get_channel()     # [K, Nr, Nt]
+            for t in range(T): 
+                s_t = modulated_grid[t]            # [K, Ns]
+                weight_t = weight[t]
+                s_t = s_t.unsqueeze(-1)            # [K, Ns, 1]
+                self.wmmse_hybrid_beamforming(H, weight_t, noise_var=self.noise_power)   # Perform WMMSE optimization (updates precoder and combiner in-place)
 
 
-            x_t = self.precoder(s_t)           # [K, Nt]
-            y_t = self.channel(x_t.unsqueeze(-1))  # [K, Nr]
-            s_hat_t = self.combiner(y_t).squeeze(0)  # [K, Ns]
-            beta_all = torch.stack([self.precoder.get_beta(k) for k in range(K)])  # [K]
-            beta_all = beta_all.view(K, 1)
+                x_t = self.precoder(s_t)           # [K, Nt]
+                y_t = self.channel(x_t.unsqueeze(-1))  # [K, Nr]
+                s_hat_t = self.combiner(y_t).squeeze(0)  # [K, Ns]
+                beta_all = torch.stack([self.precoder.get_beta(k) for k in range(K)])  # [K]
+                beta_all = beta_all.view(K, 1)
 
-            # Undo beta scaling at receiver for fair comparison
-            s_hat_rescaled = s_hat_t / beta_all  # [K, Ns]
-            s_true = s_t.squeeze(-1)             # [K, Ns]
+                # Undo beta scaling at receiver for fair comparison
+                s_hat_rescaled = s_hat_t / beta_all  # [K, Ns]
+                s_true = s_t.squeeze(-1)             # [K, Ns]
 
-            # mse_direct = torch.mean(torch.abs(s_true - s_hat_rescaled) ** 2)
-            # print("s", s_true[0], "s_hat", s_hat_rescaled[0])
-            # print("Empirical MSE (post β rescaling):", mse_direct.item())
-            output_sequence.append(s_hat_rescaled)
+                # mse_direct = torch.mean(torch.abs(s_true - s_hat_rescaled) ** 2)
+                # print("s", s_true[0], "s_hat", s_hat_rescaled[0])
+                # print("Empirical MSE (post β rescaling):", mse_direct.item())
+                output_sequence.append(s_hat_rescaled)
 
-        output_grid = torch.stack(output_sequence, dim=0)  # [T, K, Ns]
-        output_sequence = self.reshape_grid_to_modulated_sequence(output_grid, modulated_symbols.shape)  # [L, B, len, group, 2]
-        demodulate_symbol = self.mary_modulation.demodulate(output_sequence)
+            output_grid = torch.stack(output_sequence, dim=0)  # [T, K, Ns]
+            output_sequence = self.reshape_grid_to_modulated_sequence(output_grid, modulated_symbols.shape)  # [L, B, len, group, 2]
+            demodulate_symbol = self.mary_modulation.demodulate(output_sequence)
         return demodulate_symbol  # [T, K, Ns]
         # return output_grid
         

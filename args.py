@@ -84,7 +84,7 @@ def parse_args():
     parser.add_argument("--NRF", type=int, default=None, help="Override number of RF chains")
     parser.add_argument("--Ns", type=int, default=None, help="Override number of data streams")
     parser.add_argument("--num_subcarriers", type=int, default=None, help="Override number of OFDM subcarriers")
-    parser.add_argument("--noise_power", type=float, default=None, help="Override noise power")
+    parser.add_argument("--SNR", type=float, default=None, help="Override noise power")
     parser.add_argument("--M", type=int, default=None, help="Override modulation order")
 
     # --- Codebook Overrides (optional, overrides config.json if used) ---

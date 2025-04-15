@@ -1401,6 +1401,7 @@ class TextOrientedImageGeneration(nn.Module):
 
         self.len_seg = self.config.codebook_config.embedding_dim
 
+        self.siso = self.config.physical_config.SISO
         self.physical_layer = PhysicalLayerModule(self.config.physical_config, device=device)
 
         self.weight_module = WeightingModule(self.len_seg)
@@ -1580,8 +1581,11 @@ class TextOrientedImageGeneration(nn.Module):
             transmitted_indices = torch.stack(transmitted_indices, dim=0)
             received = transmitted_indices
         else:
-            importance_weight = self.weight_module(local_embeddings, self.len_seg)
-            received = self.physical_layer(transmitted_indices, importance_weight)  #  [B, len, group] recovered indices
+            if self.siso:
+                received = self.physical_layer(transmitted_indices)
+            else:
+                importance_weight = self.weight_module(local_embeddings, self.len_seg)
+                received = self.physical_layer(transmitted_indices, importance_weight)  #  [B, len, group] recovered indices
         recovered_embedding = self.quantizer.recover_embeddings(received)
         
         # STE: replace hard recovered with soft quantized during backward

@@ -25,7 +25,7 @@ export NUMEXPR_NUM_THREADS=8  # NumExpr parallelism
 
 
 # Set initial batch size (will be divided by number of GPUs)
-TOTAL_BATCH_SIZE=16  # Further reduce batch size
+TOTAL_BATCH_SIZE=4  # Further reduce batch size
 NUM_GPUS=4
 PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
@@ -33,9 +33,9 @@ PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
 OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
 # OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_20250409_191851"
-RESUME_DIR="$HOME/prompt_image_segment/outputs/stage1_phase1_user_aligned_20250410_145200/checkpoints/checkpoint_epoch_102_loss_1.8149.pth"
+RESUME_DIR="$HOME/prompt_image_segment/outputs/stage1_phase2_nonhuman_human_20250414_043454/checkpoints/checkpoint_epoch_130_loss_2.0196.pth"
 # RESUME_DIR=None
-STORE_DIR="$HOME/prompt_image_segment/stored_data/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
+STORE_DIR="$HOME/prompt_image_segment/stored_data/stage1_phase1_nonanimal_animal_$(date +%Y%m%d_%H%M%S)"
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -54,6 +54,7 @@ TRAIN_CMD="accelerate launch \
     --gradient_accumulation_steps 1 \
     --num_machines 1 \
     main.py \
+    --textalign\
     --data_dir $DATA_DIR \
     --output_dir $OUTPUT_DIR \
     --batch_size $PER_GPU_BATCH_SIZE \
@@ -61,14 +62,14 @@ TRAIN_CMD="accelerate launch \
     --num_epochs_2 200 \
     --num_epochs_3 200 \
     --start_epoch 0\
-    --start_stage 1 \
+    --start_stage 2 \
     --textalign \
     --learning_rate_g 1e-4 \
     --learning_rate_d 1e-5 \
     --learning_rate_w 1e-4 \
     --weight_decay 0.01 \
     --num_workers 1 \
-    --discriminator_update_freq 1 \
+    --discriminator_update_freq 2 \
     --lambda_sparsity 0.0 \
     --lambda_smoothness 0.0 \
     --lambda_answer 0.0 \
@@ -78,10 +79,11 @@ TRAIN_CMD="accelerate launch \
     --loss_quant 0.1 \
     --loss_gen 1.0 \
     --loss_disc 0.5 \
+    --SNR 0.0 \
     --log_interval 200 \
     --sample_interval 100 \
-    --train_category None \
-    --val_category None \
+    --train_category nonhuman \
+    --val_category human \
     --resume_from_checkpoint $RESUME_DIR\
     --generated_data_dir $STORE_DIR"
 

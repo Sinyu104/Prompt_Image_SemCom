@@ -33,10 +33,11 @@ class PhysicalConfig:
     NRF: int 
     Ns: int 
     num_subcarriers: int 
-    noise_power: float
+    SNR: float
     M: int
     num_clusters: int
     num_rays: int
+    SISO:bool
 
 @dataclass
 class CodebookConfig:

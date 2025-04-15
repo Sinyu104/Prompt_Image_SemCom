@@ -21,7 +21,7 @@ class GeometryBasedChannel(nn.Module):
         self.wavelength = wavelength
         self.noise_power = noise_power
         self.siso=siso
-        print("noise: ", self.noise_power)
+
         self.total_paths = NC * NR
         self.d = 0.5 * wavelength
 
@@ -437,8 +437,6 @@ class PhysicalLayerModule(nn.Module):
         self.power = 1.0
 
         self.noise_power = self.power/ (10 ** (self.snr / 10))
-        print("noise_power: ", self.noise_power)
-        print("siso: ", self.siso)
         
         # Channel parameters (for a geometry-based channel simulation)
         self.num_clusters = config.num_clusters

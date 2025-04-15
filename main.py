@@ -899,9 +899,7 @@ def main(args):
             for epoch in range(start_epoch, args.num_epochs_2):
                 with autocast():
                     generator.train()
-                    train_g_loss = stage2_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
-                        
-                        
+                    train_g_loss, train_a_loss, train_d_loss, train_q_loss = stage2_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
                     # Run validation every 10 epochs
                     if epoch % 10 == 0:
                         generator.eval()

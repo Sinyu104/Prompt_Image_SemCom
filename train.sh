@@ -33,9 +33,9 @@ PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
 OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
 # OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_20250409_191851"
-RESUME_DIR="$HOME/prompt_image_segment/outputs/stage1_phase2_nonhuman_human_20250414_043454/checkpoints/checkpoint_epoch_130_loss_2.0196.pth"
+RESUME_DIR="$HOME/prompt_image_segment/outputs/stage1_phase2_notextalign_nonhuman_human_20250414_050723/checkpoints/checkpoint_epoch_138_loss_1.7440.pth"
 # RESUME_DIR=None
-STORE_DIR="$HOME/prompt_image_segment/stored_data/stage1_phase1_nonanimal_animal_$(date +%Y%m%d_%H%M%S)"
+STORE_DIR="$HOME/prompt_image_segment/stored_data/debug_$(date +%Y%m%d_%H%M%S)"
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -54,38 +54,38 @@ TRAIN_CMD="accelerate launch \
     --gradient_accumulation_steps 1 \
     --num_machines 1 \
     main.py \
-    --textalign\
     --data_dir $DATA_DIR \
     --output_dir $OUTPUT_DIR \
     --batch_size $PER_GPU_BATCH_SIZE \
-    --num_epochs_1 200 \
-    --num_epochs_2 200 \
-    --num_epochs_3 200 \
+    --num_epochs_1 100 \
+    --num_epochs_2 100 \
+    --num_epochs_3 100 \
     --start_epoch 0\
     --start_stage 2 \
-    --textalign \
     --learning_rate_g 1e-4 \
     --learning_rate_d 1e-5 \
     --learning_rate_w 1e-4 \
     --weight_decay 0.01 \
     --num_workers 1 \
-    --discriminator_update_freq 2 \
+    --discriminator_update_freq 1 \
     --lambda_sparsity 0.0 \
     --lambda_smoothness 0.0 \
     --lambda_answer 0.0 \
-    --loss_recon 0.0 \
-    --loss_perc 5.0 \
-    --loss_vgg 7.0 \
+    --loss_recon 1.0 \
+    --loss_perc 0.0 \
+    --loss_vgg 10.0 \
     --loss_quant 0.1 \
     --loss_gen 1.0 \
     --loss_disc 0.5 \
-    --SNR 0.0 \
+    --SNR 10.0 \
     --log_interval 200 \
     --sample_interval 100 \
     --train_category nonhuman \
     --val_category human \
     --resume_from_checkpoint $RESUME_DIR\
-    --generated_data_dir $STORE_DIR"
+    --generated_data_dir $STORE_DIR\
+    --traditional \
+    --store_gen_data"
 
 # Execute the training command
 eval $TRAIN_CMD

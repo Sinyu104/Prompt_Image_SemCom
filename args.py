@@ -35,6 +35,8 @@ def parse_args():
                        help="Enable text alignment")
     parser.add_argument("--store_gen_data", action="store_true", 
                        help="Whether to store generator data")
+    parser.add_argument("--traditional", action="store_true", 
+                       help="encode/decode by traditional methods, e.g. jpg")
     
     # Dataset and model arguments
     parser.add_argument("--batch_size", type=int, default=32)

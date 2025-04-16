@@ -36,6 +36,7 @@ import logging
 import torch.autograd
 from args import parse_args
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from JPG import JPGTransmission
 from utils import (
     setup_logger, 
     print_network_info, 
@@ -802,6 +803,22 @@ def main(args):
     
     try:
         # Training loop
+        if args.traditional:
+            jpg = JPGTransmission(args, device=device)
+            total_u_loss = 0
+            for batch_idx, batch in enumerate(val_dataloader):
+                # Assume batch['image'] is a tensor of shape (B, C, H, W) with values in [0, 1]
+                batch_size = batch['image'].shape[0] 
+                
+                transmitted_images = [] 
+                # Process each image in the batch individually
+                for i in range(batch_size):
+                    u_loss = jpg(batch['image'][i], batch['question'][i], batch['answer_text'][i], batch['image_id'][i])  # calls the forward() method of JPGTransmission
+                    total_u_loss += u_loss.item()
+            print("Average u_loss : ", total_u_loss/len(val_dataloader))
+                
+                
+
         if args.start_stage == 1:
             logger.info("Starting training stage 1: Encoder-Decoder")
             num_epochs_phase_1 = args.num_epochs_1/2

@@ -37,6 +37,8 @@ def parse_args():
                        help="Whether to store generator data")
     parser.add_argument("--traditional", action="store_true", 
                        help="encode/decode by traditional methods, e.g. jpg")
+    parser.add_argument("--eval", action="store_true", 
+                       help="Run validation only")
     
     # Dataset and model arguments
     parser.add_argument("--batch_size", type=int, default=32)

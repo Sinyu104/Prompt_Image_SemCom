@@ -46,7 +46,8 @@ from utils import (
     setup_distributed_training,
     cleanup_distributed,
     visualize_batch,
-    store_generated_outputs
+    store_generated_outputs,
+    save_reconstructed_image
 )
 import math
 
@@ -714,7 +715,8 @@ def main(args):
             dir=args.output_dir,
             config=args,
             name=run_name,
-            resume="allow"
+            resume="allow",
+            # mode="disabled"
         )
     
     # Make sure wandb is initialized before proceeding
@@ -817,7 +819,37 @@ def main(args):
                     total_u_loss += u_loss.item()
             print("Average u_loss : ", total_u_loss/len(val_dataloader))
                 
-                
+        if args.eval:
+            total_loss = 0
+            num_batches = 0
+
+            save_path = args.generated_data_dir
+
+            if args.store_gen_data:
+                os.makedirs(args.generated_data_dir, exist_ok=True)
+                save_path = args.generated_data_dir
+
+            with torch.no_grad():
+                val_iter = tqdm(enumerate(val_dataloader), total=len(val_dataloader), desc="Evaluating", dynamic_ncols=True)
+
+                for batch_idx, batch in val_iter:
+                    with autocast():
+                        outputs = generator(batch['image'], batch['question'], batch['answer_text'], stage=2)
+                        total_loss += outputs['loss_perc'].item()
+                        num_batches += 1
+
+                        if args.store_gen_data:
+                            for i in range(outputs['generated_images'].size(0)):
+                                save_reconstructed_image(
+                                    outputs['generated_images'][i],
+                                    save_path,
+                                    batch['image_id'][i].item() if torch.is_tensor(batch['image_id'][i]) else batch['image_id'][i],
+                                )
+
+            avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+            print("The average loss is : ", avg_loss)
+            return avg_loss
+
 
         if args.start_stage == 1:
             logger.info("Starting training stage 1: Encoder-Decoder")

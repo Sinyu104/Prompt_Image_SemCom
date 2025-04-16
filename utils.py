@@ -196,6 +196,31 @@ def store_generated_outputs(image_tensor, question, answer, image_id, save_path)
     }
     with open(save_path, 'a') as f:
         f.write(json.dumps(entry) + '\n')
+
+def save_reconstructed_image(reconstructed, save_path, image_id):
+    """
+    Save the reconstructed image as a standalone file.
+
+    Args:
+        reconstructed (torch.Tensor): Reconstructed image tensor (C, H, W) in [0, 1].
+        save_path (str): Directory to save the image.
+        image_id (int or str): Identifier for the image.
+    """
+    # Convert tensor to (H, W, C) numpy array
+    reconstructed_np = reconstructed.detach().cpu().permute(1, 2, 0).numpy()
+
+    # Clip values to [0, 1] for valid RGB display
+    reconstructed_np = np.clip(reconstructed_np, 0.0, 1.0)
+
+    # Plot and save
+    plt.figure(figsize=(5, 5))
+    plt.imshow(reconstructed_np)
+    plt.axis("off")
+    plt.tight_layout()
+
+    save_path_full = os.path.join(save_path, f"reconstructed_{image_id}.png")
+    plt.savefig(save_path_full, bbox_inches='tight', pad_inches=0, dpi=300)
+    plt.close()
         
 @torch.no_grad()
 def visualize_batch(image, generated_images, question, gt_answer, epoch, batch_idx, args, mode='train'):

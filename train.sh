@@ -33,7 +33,7 @@ PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
 OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
 # OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_20250409_191851"
-RESUME_DIR="$HOME/prompt_image_segment/outputs/stage1_phase2_notextalign_nonhuman_human_20250414_050723/checkpoints/checkpoint_epoch_138_loss_1.7440.pth"
+RESUME_DIR="$HOME/prompt_image_segment/outputs/stage1_phase2_nonhuman_human_20250414_043454/checkpoints/checkpoint_epoch_130_loss_2.0196.pth"
 # RESUME_DIR=None
 STORE_DIR="$HOME/prompt_image_segment/stored_data/debug_$(date +%Y%m%d_%H%M%S)"
 
@@ -54,6 +54,7 @@ TRAIN_CMD="accelerate launch \
     --gradient_accumulation_steps 1 \
     --num_machines 1 \
     main.py \
+    --textalign\
     --data_dir $DATA_DIR \
     --output_dir $OUTPUT_DIR \
     --batch_size $PER_GPU_BATCH_SIZE \
@@ -84,8 +85,7 @@ TRAIN_CMD="accelerate launch \
     --val_category human \
     --resume_from_checkpoint $RESUME_DIR\
     --generated_data_dir $STORE_DIR\
-    --traditional \
-    --store_gen_data"
+    --eval "
 
 # Execute the training command
 eval $TRAIN_CMD

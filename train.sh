@@ -31,11 +31,11 @@ PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
 # Directory paths
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
-OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
-# OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_20250409_191851"
-RESUME_DIR="$HOME/prompt_image_segment/outputs/stage1_phase2_nonhuman_human_20250414_043454/checkpoints/checkpoint_epoch_130_loss_2.0196.pth"
+# OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="$HOME/prompt_image_segment/outputs/stage2_LLava_nonanimal_animal_$(date +%Y%m%d_%H%M%S)"
+RESUME_DIR="$HOME/prompt_image_segment/outputs/stage2_nonanimal_animal_20250415_153515/checkpoints/checkpoint_epoch_25_loss_2.2182.pth"
 # RESUME_DIR=None
-STORE_DIR="$HOME/prompt_image_segment/stored_data/debug_$(date +%Y%m%d_%H%M%S)"
+STORE_DIR="$HOME/prompt_image_segment/stored_data/Traditional_SNR10"
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -72,20 +72,19 @@ TRAIN_CMD="accelerate launch \
     --lambda_sparsity 0.0 \
     --lambda_smoothness 0.0 \
     --lambda_answer 0.0 \
-    --loss_recon 1.0 \
-    --loss_perc 0.0 \
-    --loss_vgg 10.0 \
-    --loss_quant 0.1 \
+    --loss_recon 0.0 \
+    --loss_perc 1.0 \
+    --loss_vgg 1.0 \
+    --loss_quant 0.5 \
     --loss_gen 1.0 \
     --loss_disc 0.5 \
-    --SNR 10.0 \
-    --log_interval 200 \
+    --SNR 15.0 \
+    --log_interval 1000 \
     --sample_interval 100 \
-    --train_category nonhuman \
-    --val_category human \
+    --train_category nonanimal \
+    --val_category animal \
     --resume_from_checkpoint $RESUME_DIR\
-    --generated_data_dir $STORE_DIR\
-    --eval "
+    --generated_data_dir $STORE_DIR"
 
 # Execute the training command
 eval $TRAIN_CMD

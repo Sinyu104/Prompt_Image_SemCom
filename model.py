@@ -42,7 +42,7 @@ from torchvision import models
 import torch.nn.utils.spectral_norm as spectral_norm
 from channel import PhysicalLayerModule
 from transformers import CLIPModel, CLIPProcessor
-
+from torchvision.transforms.functional import to_pil_image
 
 logger = logging.get_logger(__name__)
 
@@ -1630,6 +1630,114 @@ class TextOrientedImageGeneration(nn.Module):
             decoder_output=decoder_outputs,
         )
 
+class LLavaAnswerGenerationModel(nn.Module):
+    def __init__(self, model_path, load_in_8bit=False, device=None):
+        super().__init__()
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Load model
+        self.llava = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float32,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            device_map=None,
+        )
+        if not self.llava.get_vision_tower().is_loaded:
+            self.llava.get_vision_tower().load_model()
+
+        for param in self.llava.parameters():
+            param.requires_grad = False  # freeze LLaVA
+
+        # Tokenizer only (drop processor/image_processor)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+        # Vision tower input normalization (LLaVA ViT image normalization stats)
+        self.image_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        self.image_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+    def preprocess_image(self, image):
+        """
+        Resizes and normalizes input tensor image (B, 3, H, W)
+        to match the LLaVA ViT input requirements (336x336, normalized).
+        """
+        image = F.interpolate(image, size=(378, 378), mode="bilinear", align_corners=False)
+        image = (image - self.image_mean.to(image.device)) / self.image_std.to(image.device)
+        return image
+
+    def preprocess_text(self, questions):
+        """
+        Tokenizes prompts of the format "<image>\n{question}".
+        Inserts LLaVA-specific image token -200.
+        """
+        input_ids = []
+        for q in questions:
+            prompt = f"<image>\n{q}"
+            chunks = [self.tokenizer(chunk).input_ids for chunk in prompt.split("<image>")]
+            ids = chunks[0] + [-200] + chunks[1]
+            input_ids.append(torch.tensor(ids, dtype=torch.long))
+
+        padded_input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        ).to(self.device)
+        attention_mask = (padded_input_ids != self.tokenizer.pad_token_id).long()
+        return padded_input_ids, attention_mask
+
+    def forward(self, images, generated_images, questions):
+        device = images.device
+        batch_size = images.size(0)
+
+        # === Differentiable preprocessing ===
+        target_pre = self.preprocess_image(images.clamp(0, 1))
+        gen_pre = self.preprocess_image(generated_images.clamp(0, 1))
+
+        # === Tokenize input
+        input_ids, attention_mask = self.preprocess_text(questions)
+
+        # === Forward through LLaVA
+        with torch.no_grad():
+            real_out = self.llava(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                images=target_pre,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+            total_seq_len = real_out.hidden_states[-1].shape[1]
+            text_len = input_ids.shape[1]
+            img_token_len = total_seq_len - text_len
+            real_feat = real_out.hidden_states[-1][:, :img_token_len, :]
+
+        gen_out = self.llava(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            images=gen_pre,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+
+        # === Extract image token embeddings (final layer)
+        
+
+        with torch.no_grad():
+            gen_feat_nograd = gen_out.hidden_states[-1][:, :img_token_len, :]
+
+        gen_feat_raw = gen_out.hidden_states[-1][:, :img_token_len, :]  # has grad
+
+        # ✅ Apply correct STE
+        gen_feat = gen_feat_nograd.detach() + (gen_feat_raw - gen_feat_raw.detach())
+
+        # === Normalize & compute cosine similarity
+        real_feat = F.normalize(real_feat, dim=-1)
+        gen_feat = F.normalize(gen_feat, dim=-1)
+        cosine_sim = (real_feat * gen_feat).sum(dim=-1)
+        loss_perc = 1 - cosine_sim.mean()
+
+        return {
+            "loss_perc": loss_perc,
+            "real_feat": real_feat,
+            "gen_feat": gen_feat,
+        }
 
 class AnswerGenerationModel(nn.Module):
     def __init__(self, model_name='openai/clip-vit-base-patch16', device=None):
@@ -1637,59 +1745,80 @@ class AnswerGenerationModel(nn.Module):
 
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # Load CLIP model and processor
+        # Load CLIP model and image processor
         self.clip = CLIPModel.from_pretrained(model_name).eval().to(self.device)
-        self.processor = CLIPProcessor.from_pretrained(model_name)
-
-        # Perceptual loss
-        self.perc_loss = nn.L1Loss()
+        self.processor =CLIPProcessor.from_pretrained(model_name)
 
         for param in self.clip.parameters():
-            param.requires_grad = False  # Freeze CLIP parameters
+            param.requires_grad = False  # freeze CLIP
 
+    def normalize_for_clip(self, x, eps=1e-6):
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=x.device).view(1, 3, 1, 1)
+        std  = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=x.device).view(1, 3, 1, 1)
+        return (x - mean) / (std + eps)
+    
+    def resize_for_clip(self, x, size=224):
+        return F.interpolate(x, size=(size, size), mode='bilinear', align_corners=False)
 
     def forward(self, images, generated_images, questions, answers):
-        """Forward pass using CLIP for perceptual alignment"""
-        # Ensure images and texts are lists
+        """Compute perceptual loss between real and generated images using CLIP"""
+        # Ensure lists
         if not isinstance(questions, list):
             questions = [questions]
         if not isinstance(answers, list):
             answers = [answers]
 
+        # Construct prompts: Q + A pairs
         prompts = [f"Q: {q} A: {a}" for q, a in zip(questions, answers)]
-        images = images.detach().clamp(0, 1).float()
-        generated_images = generated_images.detach().clamp(0, 1).float()
+     
 
-        # Tokenize with text
-        inputs_real = self.processor(text=prompts, images=images, return_tensors="pt", padding=True, do_rescale=False)
-        inputs_gen = self.processor(text=prompts, images=generated_images, return_tensors="pt", padding=True, do_rescale=False)
 
-        # Move inputs to device
-        inputs_real = {k: v.to(self.device) for k, v in inputs_real.items()}
-        inputs_gen = {k: v.to(self.device) for k, v in inputs_gen.items()}
+        # Clamp images to [0, 1]
+        images = images.detach().clamp(0, 1).float()           # no grad
+        generated_images = generated_images.clamp(0, 1).float()  # with grad
+
+        # === Encode text (no grad)
         with torch.no_grad():
-            img_feats_real = self.clip.get_image_features(pixel_values=inputs_real["pixel_values"])
-            img_feats_gen  = self.clip.get_image_features(pixel_values=inputs_gen["pixel_values"])
-            txt_feats      = self.clip.get_text_features(input_ids=inputs_real["input_ids"], attention_mask=inputs_real["attention_mask"])
+            text_inputs = self.processor(
+                text=prompts, return_tensors="pt", padding=True, truncation=True
+            ).to(self.device)
+            txt_feats = self.clip.get_text_features(**text_inputs)
+            txt_feats = F.normalize(txt_feats, dim=-1, eps=1e-6)
 
-        img_feats_real = F.normalize(img_feats_real, dim=-1, eps=1e-6)
-        img_feats_gen  = F.normalize(img_feats_gen, dim=-1, eps=1e-6)
-        txt_feats      = F.normalize(txt_feats, dim=-1, eps=1e-6)
+        # === Encode real images (no grad)
+        with torch.no_grad():
+            real_inputs = self.processor(images=images.detach(), return_tensors="pt").to(self.device)
+            img_feats_real = self.clip.get_image_features(**real_inputs)
+            img_feats_real = F.normalize(img_feats_real, dim=-1, eps=1e-6)
 
-        # Compute cosine similarity
-        cos_sim_real = (img_feats_real * txt_feats).sum(dim=-1)
-        cos_sim_gen  = (img_feats_gen * txt_feats).sum(dim=-1)
-        
+        # === Encode generated images (with grad using STE)
+        normalized_gen = self.normalize_for_clip(self.resize_for_clip(generated_images))
 
-        loss_perc = F.l1_loss(cos_sim_gen, cos_sim_real)*10
+        # Non-differentiable path (used for value target)
+        with torch.no_grad():
+            img_feats_gen_nograd = self.clip.get_image_features(pixel_values=normalized_gen)
+
+        # === Proxy path (STE) ===
+        proxy = normalized_gen.clone().detach().requires_grad_(True)  # new input w/ grad
+        proxy_out = self.clip.get_image_features(pixel_values=proxy)
+        proxy_out = F.normalize(proxy_out, dim=-1, eps=1e-6)
+
+        # === Apply STE trick ===
+        img_feats_gen = img_feats_gen_nograd + (proxy_out - proxy_out.detach())
+        img_feats_gen = F.normalize(img_feats_gen, dim=-1, eps=1e-6)
+
+        # === Cosine similarity
+        sim_real = (img_feats_real * txt_feats).sum(dim=-1)  # [B], no grad
+        sim_gen  = (img_feats_gen  * txt_feats).sum(dim=-1)  # [B], has grad
+
+        # === Perceptual loss
+        loss_perc = F.l1_loss(sim_gen, sim_real) * 10.0  # scale for stability
 
         return {
-            'cos_gen_features': cos_sim_gen,
-            'cos_target_features': cos_sim_real,
+            'cos_gen_features': sim_gen,
+            'cos_target_features': sim_real,
             'loss_perc': loss_perc,
         }
-
-
 
 class VGGPerceptualLoss(nn.Module):
     def __init__(self, layers=["relu1_2", "relu2_2", "relu3_3"], use_l1=True):
@@ -1749,10 +1878,16 @@ class VQAWithSegmentation(nn.Module):
         
         # Initialize models
         self.image_generation_model = TextOrientedImageGeneration(config=config, device=self.device)
-        self.perceptual_model = AnswerGenerationModel(
-            model_name='openai/clip-vit-base-patch16',
+        # self.perceptual_model = AnswerGenerationModel(
+        #     model_name='openai/clip-vit-base-patch16',
+        #     device=self.device
+        # )
+        self.perceptual_model = LLavaAnswerGenerationModel(
+            model_path="qnguyen3/nanoLLaVA-1.5",
+            load_in_8bit=False,
             device=self.device
         )
+
 
         # Reconstruction Loss (e.g., L1 Loss)
         self.recon_loss = nn.L1Loss()
@@ -1799,7 +1934,11 @@ class VQAWithSegmentation(nn.Module):
         # 2. Perceptual Loss
         # --------------------
         # Add batch dimension for interpolation
-        perceptual_loss = self.perceptual_model(images, generated_images, questions, answer)['loss_perc']
+        perceptual_loss = self.perceptual_model(images, generated_images, questions)['loss_perc']
+        # Ensure values are in [0, 1] and resize
+
+
+        # perceptual_loss = self.perceptual_model(images, generated_images, questions)['loss_perc']
         
         # Add VGG perceptual loss
         vgg_loss = self.vgg_loss(generated_images, images)
@@ -2047,3 +2186,7 @@ class WeightingModule(nn.Module):
         weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)
         return weights
 
+def tensor_to_pil(img_tensor):
+    # Ensure it's on CPU and detached
+    img_tensor = img_tensor.detach().cpu().clamp(0, 1)
+    return to_pil_image(img_tensor)

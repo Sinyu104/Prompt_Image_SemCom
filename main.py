@@ -267,16 +267,20 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
             for batch_idx, batch in enumerate(train_dataloader):
                 # Train Discriminator only on even batch indices
                 optimizer_G.zero_grad()
-                with autocast():
+                with autocast(enabled=False):
                     outputs = generator(batch['image'], batch['question'], batch['answer_text'], stage=1)
                     generated_images = outputs['generated_images']
                     generated_images = torch.clamp(generated_images, 0, 1)
         
                     g_loss = (
+                        args.loss_recon * outputs['loss_recon'] +
                         args.loss_vgg * outputs['loss_vgg'] +
                         args.loss_perc   * outputs['loss_perc'] +
                         args.loss_quant * outputs['quantization_loss'] 
                     )
+                    logger.debug(f"loss_recon: {outputs['loss_recon'].item()}, loss_perc : {outputs['loss_perc'].item()}, loss_vgg: {outputs['loss_vgg'].item()}, loss_quant: {outputs['quantization_loss']} ")
+                    
+
                 accelerator.backward(g_loss)
                 
                 # Clip gradients for generator
@@ -808,11 +812,11 @@ def main(args):
         if args.traditional:
             jpg = JPGTransmission(args, device=device)
             total_u_loss = 0
-            for batch_idx, batch in enumerate(val_dataloader):
+            for batch_idx, batch in enumerate(tqdm(val_dataloader, desc="Evaluating JPG")):
                 # Assume batch['image'] is a tensor of shape (B, C, H, W) with values in [0, 1]
                 batch_size = batch['image'].shape[0] 
                 
-                transmitted_images = [] 
+                
                 # Process each image in the batch individually
                 for i in range(batch_size):
                     u_loss = jpg(batch['image'][i], batch['question'][i], batch['answer_text'][i], batch['image_id'][i])  # calls the forward() method of JPGTransmission

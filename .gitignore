@@ -23,6 +23,7 @@ gqa_data/
 checkpoints/
 train.sh
 split_cache/
+plot*
 copy_to_cc.sh
 channel_eval.py
 *.pth

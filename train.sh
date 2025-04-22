@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Set environment variables
-export CUDA_VISIBLE_DEVICES=0,1,2,3  # Use all 4 GPUs
+export CUDA_VISIBLE_DEVICES=2  # Use all 4 GPUs
 export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128,garbage_collection_threshold:0.6"
 export TORCH_DISTRIBUTED_DEBUG=DETAIL  # Add debug info
 export NCCL_DEBUG=WARNING
@@ -25,8 +25,8 @@ export NUMEXPR_NUM_THREADS=8  # NumExpr parallelism
 
 
 # Set initial batch size (will be divided by number of GPUs)
-TOTAL_BATCH_SIZE=4  # Further reduce batch size
-NUM_GPUS=4
+TOTAL_BATCH_SIZE=1  # Further reduce batch size
+NUM_GPUS=1
 PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
 # Directory paths
@@ -48,7 +48,6 @@ python3 -c "import torch; torch.cuda.empty_cache()"
 
 # Run training script with arguments
 TRAIN_CMD="accelerate launch \
-    --multi_gpu \
     --num_processes $NUM_GPUS \
     --mixed_precision fp16 \
     --gradient_accumulation_steps 1 \
@@ -62,7 +61,7 @@ TRAIN_CMD="accelerate launch \
     --num_epochs_2 100 \
     --num_epochs_3 100 \
     --start_epoch 0\
-    --start_stage 2 \
+    --start_stage 1 \
     --learning_rate_g 1e-4 \
     --learning_rate_d 1e-5 \
     --learning_rate_w 1e-4 \
@@ -78,7 +77,7 @@ TRAIN_CMD="accelerate launch \
     --loss_quant 0.5 \
     --loss_gen 1.0 \
     --loss_disc 0.5 \
-    --SNR 15.0 \
+    --SNR 40.0 \
     --log_interval 1000 \
     --sample_interval 100 \
     --train_category nonanimal \

@@ -43,6 +43,9 @@ import torch.nn.utils.spectral_norm as spectral_norm
 from channel import PhysicalLayerModule
 from transformers import CLIPModel, CLIPProcessor
 from torchvision.transforms.functional import to_pil_image
+import types
+from contextlib import suppress
+import importlib
 
 logger = logging.get_logger(__name__)
 
@@ -1630,114 +1633,281 @@ class TextOrientedImageGeneration(nn.Module):
             decoder_output=decoder_outputs,
         )
 
-class LLavaAnswerGenerationModel(nn.Module):
-    def __init__(self, model_path, load_in_8bit=False, device=None):
+class _NoDetachEmbed(nn.Module):
+    def __init__(self, orig_embed: nn.Module):
         super().__init__()
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.orig = orig_embed
 
-        # Load model
+    def forward(self, input_ids=None, inputs_embeds=None):
+        # 1) if we're given inputs_embeds, just cast and KEEP grad
+        if inputs_embeds is not None:
+            return inputs_embeds.to(
+                dtype=self.orig.weight.dtype,
+                device=self.orig.weight.device
+            )
+        # 2) otherwise fall back to the original embed lookup,
+        #    passing the tensor as a positional argument:
+        return self.orig(input_ids)
+# ------------------------------------------------------------------
+# 1.  Patch nanoLLaVA so encode_images keeps the computation graph
+# ------------------------------------------------------------------
+def _encode_images_nodetach(self, images):
+    device, dtype = images.device, images.dtype
+
+    # 1) load the tower if needed
+    vt = self.get_vision_tower()
+    if not vt.is_loaded:
+        vt.load_model()
+
+    # 2) grab the raw backbone directly:
+    #    SigLipVisionTower has a child `vision_tower` (SigLipVisionModel)
+    #    which itself has `.vision_model` (the ViT).
+    backbone = vt.vision_tower.vision_model.to(device=device, dtype=dtype)
+
+    # 3) forward under AMP but NOT under no_grad
+    with torch.autocast(device.type, torch.float16):
+        raw = backbone(images.to(device=device, dtype=dtype))
+        # unwrap ModelOutput or tuple to get the tensor
+        if hasattr(raw, "last_hidden_state"):
+            feats = raw.last_hidden_state
+        elif isinstance(raw, tuple):
+            feats = raw[0]
+        else:
+            feats = raw
+
+    # 4) drop the CLS token
+    feats = feats[:, 1:]  # (B, n_patches, D_feat)
+
+    # 5) locate the projector
+    proj = None
+    for name in ("mm_projector", "vision_proj",
+                 f"{self.base_model_prefix}.mm_projector",
+                 f"{self.base_model_prefix}.vision_proj"):
+        obj = self
+        for attr in name.split("."):
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if isinstance(obj, torch.nn.Module):
+            proj = obj
+            break
+    if proj is None:
+        raise RuntimeError("Could not locate the vision→LM projector")
+
+    # 6) pad/clip feature dim to match proj
+    in_dim = (proj[0].in_features 
+              if isinstance(proj, torch.nn.Sequential)
+              else proj.in_features)
+    d_feat = feats.shape[-1]
+    if d_feat != in_dim:
+        diff = in_dim - d_feat
+        if diff > 0:
+            feats = F.pad(feats, (0, diff))
+        else:
+            feats = feats[..., :in_dim]
+
+    proj = proj.to(device=device, dtype=dtype)
+    # 7) project (grad graph intact)
+    return proj(feats)  # (B, n_patches, hidden_size)
+
+
+
+
+# ------------------------------------------------------------------
+# 2. patch multimodal‑prep  (identical API, removed .detach())
+# ------------------------------------------------------------------
+def _prep_inputs_no_detach(
+    self,
+    input_ids, position_ids, attention_mask,
+    past_key_values=None, labels=None, images=None
+):
+    # 1) figure out the image‑placeholder token id
+    img_id = getattr(self.config, "image_token_id", -200)
+
+    # 2) early exit if no images or single‑token generation
+    if images is None or input_ids.size(1) == 1:
+        return (input_ids, position_ids, attention_mask,
+                past_key_values, None, labels)
+
+    # 3) get vision tokens (our patched encode_images never detaches)
+    img_embeds = self.encode_images(images)     # (B, N_img, D)
+
+    # 4) build text embeddings safely: replace -200 → pad_id
+    pad_id      = self.config.pad_token_id or 0
+    safe_ids    = input_ids.clone()
+    safe_ids[safe_ids == img_id] = pad_id
+    tok_embed   = self.get_input_embeddings()
+    input_embeds= tok_embed(safe_ids)          # (B, L, D)
+
+    # 5) locate exactly one placeholder per sample
+    mask  = (input_ids == img_id)              # (B, L)
+    counts= mask.sum(dim=1).cpu()              # to CPU, avoid GPU assert
+    if (counts == 0).any():
+        raise RuntimeError("No <image> token in at least one prompt.")
+    # if >1, torch.argmax picks the first anyway
+    pos   = mask.float().argmax(dim=1)         # (B,) on CUDA
+
+    # 6) splice in the image tokens with a differentiable cat
+    B, L, H = input_embeds.shape               # unpack safely
+    img_embeds = img_embeds.to(input_embeds.dtype)
+    parts = []
+    for b in range(B):
+        p     = pos[b].item()
+        left  = input_embeds[b, :p    , :].reshape(-1, H)   # (p, H)
+        mid   = img_embeds[b].reshape(-1, H)                # (N_img, H)
+        right = input_embeds[b, p+1:, :].reshape(-1, H)     # (L-p-1, H)
+        parts.append(torch.cat([left, mid, right], dim=0))
+    input_embeds = torch.stack(parts, dim=0) # (B, L-1+N_img, H)
+
+    # ◀─── **unbreak the graph** by making this a leaf
+    # input_embeds.requires_grad_(True)
+
+    # 7) tell the LM to use our embeds (and skip its own embed_tokens)
+    return (
+        None,
+        position_ids,
+        attention_mask,
+        past_key_values,
+        input_embeds,
+        labels
+    )
+
+
+
+# ------------------------------------------------------------------
+# single patch function
+# ------------------------------------------------------------------
+def _no_detach_shift_embeds(inputs_embeds, pad_token_id=None, **kwargs):
+    """
+    Replace the original shift_tokens_right so it DOES NOT call .detach().
+    """
+    B, L, D = inputs_embeds.size()
+    shifted = inputs_embeds.new_zeros((B, L, D))
+    # copy everything except the last token (no detach)
+    shifted[:, 1:, :] = inputs_embeds[:, :-1, :]
+    # the caller normally fills in a BOS embedding at [:, 0, :], 
+    # but if pad_token_id==bos_token_id you can skip or mimic that:
+    # shifted[:, 0, :] = bos_emb
+    return shifted
+
+def _patch_llava(llava):
+    # 1) patch encode_images
+    llava.encode_images = types.MethodType(_encode_images_nodetach, llava)
+
+    for name in ("prepare_inputs_labels_for_multimodal",
+                 "prepare_inputs_for_multimodal"):
+        with suppress(AttributeError):
+            setattr(
+                llava,
+                name,
+                types.MethodType(_prep_inputs_no_detach, llava)
+            )
+
+
+     # **here comes the new patch**: override the shift helper
+    # it might be called "_shift_right" or "shift_tokens_right"—try both
+    # now override the *module*‐level helpers so that your no‐detach version runs
+    # module_path = llava.__class__.__module__  
+    # mod = importlib.import_module(module_path)
+    # print("mod: ", mod)
+
+    # # replace the free functions
+    # if hasattr(mod, "prepare_inputs_labels_for_multimodal"):
+    #     mod.prepare_inputs_labels_for_multimodal = _prep_inputs_no_detach
+    # if hasattr(mod, "prepare_inputs_for_multimodal"):
+    #     mod.prepare_inputs_for_multimodal = _prep_inputs_no_detach
+
+    return llava
+
+
+# ---------------------------------------------------------------------
+# 2.  The updated answer‑generation / perceptual‑loss model
+# ---------------------------------------------------------------------
+class LLavaAnswerGenerationModel(nn.Module):
+    def __init__(self, model_path: str, device=None):
+        super().__init__()
+        self.device = device 
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.llava = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.float32,
+            torch_dtype=torch.float16,
             trust_remote_code=True,
             low_cpu_mem_usage=True,
-            device_map=None,
-        )
-        if not self.llava.get_vision_tower().is_loaded:
-            self.llava.get_vision_tower().load_model()
-
-        for param in self.llava.parameters():
-            param.requires_grad = False  # freeze LLaVA
-
-        # Tokenizer only (drop processor/image_processor)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-
-        # Vision tower input normalization (LLaVA ViT image normalization stats)
-        self.image_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        self.image_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-
-    def preprocess_image(self, image):
-        """
-        Resizes and normalizes input tensor image (B, 3, H, W)
-        to match the LLaVA ViT input requirements (336x336, normalized).
-        """
-        image = F.interpolate(image, size=(378, 378), mode="bilinear", align_corners=False)
-        image = (image - self.image_mean.to(image.device)) / self.image_std.to(image.device)
-        return image
-
-    def preprocess_text(self, questions):
-        """
-        Tokenizes prompts of the format "<image>\n{question}".
-        Inserts LLaVA-specific image token -200.
-        """
-        input_ids = []
-        for q in questions:
-            prompt = f"<image>\n{q}"
-            chunks = [self.tokenizer(chunk).input_ids for chunk in prompt.split("<image>")]
-            ids = chunks[0] + [-200] + chunks[1]
-            input_ids.append(torch.tensor(ids, dtype=torch.long))
-
-        padded_input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
         ).to(self.device)
-        attention_mask = (padded_input_ids != self.tokenizer.pad_token_id).long()
-        return padded_input_ids, attention_mask
+        _patch_llava(self.llava)
+        
+        for p in self.llava.parameters():
+            p.requires_grad = False
+        self.llava.eval()
 
-    def forward(self, images, generated_images, questions):
-        device = images.device
-        batch_size = images.size(0)
+        
 
-        # === Differentiable preprocessing ===
-        target_pre = self.preprocess_image(images.clamp(0, 1))
-        gen_pre = self.preprocess_image(generated_images.clamp(0, 1))
+        self.register_buffer("image_mean",
+                             torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1,3,1,1))
+        self.register_buffer("image_std",
+                             torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1,3,1,1))
 
-        # === Tokenize input
+    def _prep_img(self, x):
+        x = F.interpolate(x, (378,378), mode="bilinear", align_corners=False)
+        return (x - self.image_mean) / self.image_std
+    def preprocess_text(self, questions):
+        ids_list = []
+        for q in questions:
+            # 1) tokenize the question, *no* "<image>" string
+            q_ids = self.tokenizer(q, add_special_tokens=False).input_ids
+            # 2) prepend the single image‑placeholder token ‑200
+            ids = [-200] + q_ids
+            ids_list.append(torch.tensor(ids, dtype=torch.long))
+
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        ).to(self.device)
+
+        attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+        return input_ids, attention_mask
+
+    def forward(self, images, gen_images, questions):
+
+        # ------------------------------------------------------------------
+        # images
+        img_ref = self._prep_img(images.clamp(0, 1).to(self.device))
+        img_gen = self._prep_img(gen_images.clamp(0, 1))
+
+        # ------------------------------------------------------------------
+        # text  (adds the single ‑200 token per sample)
         input_ids, attention_mask = self.preprocess_text(questions)
 
-        # === Forward through LLaVA
-        with torch.no_grad():
-            real_out = self.llava(
+        # ------------------------------------------------------------------
+        # LLaVA forward  (NO `toks`, only the ids we just built)
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            ref_out = self.llava(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                images=target_pre,
+                images=img_ref,
                 output_hidden_states=True,
                 use_cache=False,
             )
-            total_seq_len = real_out.hidden_states[-1].shape[1]
-            text_len = input_ids.shape[1]
-            img_token_len = total_seq_len - text_len
-            real_feat = real_out.hidden_states[-1][:, :img_token_len, :]
 
-        gen_out = self.llava(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            images=gen_pre,
-            output_hidden_states=True,
-            use_cache=False,
-        )
+            gen_out = self.llava(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                images=img_gen,
+                output_hidden_states=True,
+                use_cache=False,
+            )
 
-        # === Extract image token embeddings (final layer)
-        
-
-        with torch.no_grad():
-            gen_feat_nograd = gen_out.hidden_states[-1][:, :img_token_len, :]
-
-        gen_feat_raw = gen_out.hidden_states[-1][:, :img_token_len, :]  # has grad
-
-        # ✅ Apply correct STE
-        gen_feat = gen_feat_nograd.detach() + (gen_feat_raw - gen_feat_raw.detach())
-
-        # === Normalize & compute cosine similarity
-        real_feat = F.normalize(real_feat, dim=-1)
+        # ------------------------------------------------------------------
+        # slice image tokens and cosine perceptual loss
+        txt_len = input_ids.shape[1]                     #  <<< was toks.input_ids
+        total   = ref_out.hidden_states[-1].shape[1]
+        img_tok = total - txt_len
+        ref_feat = ref_out.hidden_states[-1][:, :img_tok, :]
+        gen_feat = gen_out.hidden_states[-1][:, :img_tok, :]
+        ref_feat = F.normalize(ref_feat, dim=-1)
         gen_feat = F.normalize(gen_feat, dim=-1)
-        cosine_sim = (real_feat * gen_feat).sum(dim=-1)
-        loss_perc = 1 - cosine_sim.mean()
+        loss = 1.0 - (ref_feat * gen_feat).sum(dim=-1).mean()
+        return {"loss_perc": loss}
 
-        return {
-            "loss_perc": loss_perc,
-            "real_feat": real_feat,
-            "gen_feat": gen_feat,
-        }
 
 class AnswerGenerationModel(nn.Module):
     def __init__(self, model_name='openai/clip-vit-base-patch16', device=None):
@@ -1884,7 +2054,6 @@ class VQAWithSegmentation(nn.Module):
         # )
         self.perceptual_model = LLavaAnswerGenerationModel(
             model_path="qnguyen3/nanoLLaVA-1.5",
-            load_in_8bit=False,
             device=self.device
         )
 

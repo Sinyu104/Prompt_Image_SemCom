@@ -4,7 +4,7 @@ import io
 import os
 import torch
 from torch import nn
-from model import AnswerGenerationModel
+from model import LLavaAnswerGenerationModel
 from utils import store_generated_outputs
 from torchvision.transforms import ToPILImage, ToTensor
 
@@ -246,8 +246,9 @@ class JPGTransmission(nn.Module):
             os.makedirs(args.generated_data_dir, exist_ok=True)
             self.generated_data_dir = args.generated_data_dir
 
-        self.perceptual_model = AnswerGenerationModel(
-            model_name='openai/clip-vit-base-patch16',
+        self.perceptual_model = LLavaAnswerGenerationModel(
+            model_path="qnguyen3/nanoLLaVA-1.5",
+            load_in_8bit=False,
             device=self.device
         )
 
@@ -278,8 +279,7 @@ class JPGTransmission(nn.Module):
         # ---- BER Calculation ----
         bit_errors = np.sum(body_bits != recovered_bits)
         ber = bit_errors / len(body_bits)
-        print(f"Bit errors: {bit_errors} / {len(body_bits)}")
-        print(f"Bit Error Rate (BER): {ber:.6f}")
+
 
         # ---- Reconstruct JPEG Bytes ----
         recovered_body_bytes = bits_to_jpeg_bytes(recovered_bits)
@@ -303,5 +303,5 @@ class JPGTransmission(nn.Module):
         
         # Compute perceptual loss between the original and received images.
         perceptual_loss = self.perceptual_model(input_image, received_image, question, answer)['loss_perc']
-        print("perceptual_loss: ", perceptual_loss)
+
         return perceptual_loss

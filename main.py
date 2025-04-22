@@ -333,6 +333,7 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
             total_d_loss = 0
             total_a_loss = 0
             total_q_loss = 0
+            total_p_loss = 0
             lambda_gp = 1.0
             for batch_idx, batch in enumerate(train_dataloader):
                 # Train Discriminator only on even batch indices
@@ -387,6 +388,7 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
                 total_g_loss += g_loss.item()   # Track generator loss
                 total_a_loss += g_loss_adv.item()   # Track VGG loss
                 total_d_loss += d_loss.item()  # Track discriminator loss
+                total_p_loss += outputs['loss_perc'].item()
                 total_q_loss += outputs['quantization_loss'].item()   # Track quantization loss
                 
                 # Update progress bar on main process
@@ -440,7 +442,7 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
     # Set gradient clipping
     torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
     
-    return total_g_loss / len(train_dataloader), total_a_loss / len(train_dataloader), total_d_loss / len(train_dataloader), total_q_loss / len(train_dataloader)
+    return total_g_loss / len(train_dataloader), total_a_loss / len(train_dataloader), total_d_loss / len(train_dataloader), total_q_loss / len(train_dataloader), total_p_loss / len(train_dataloader)
 
 def stage2_train(generator, discriminator, train_dataloader, optimizer, epoch, device, args, accelerator):
     """
@@ -489,6 +491,7 @@ def stage2_train(generator, discriminator, train_dataloader, optimizer, epoch, d
         total_d_loss = 0
         total_a_loss = 0
         total_q_loss = 0
+        total_p_loss = 0
         lambda_gp = 1.0
         for batch_idx, batch in enumerate(train_dataloader):
             # Train Discriminator only on even batch indices
@@ -543,6 +546,7 @@ def stage2_train(generator, discriminator, train_dataloader, optimizer, epoch, d
             total_g_loss += g_loss.item()   # Track generator loss
             total_a_loss += g_loss_adv.item()   # Track VGG loss
             total_d_loss += d_loss.item()  # Track discriminator loss
+            total_q_loss += outputs['loss_perc'].item() # Track LLaVA loss
             total_q_loss += outputs['quantization_loss'].item()   # Track quantization loss
             
             # Update progress bar on main process
@@ -592,7 +596,7 @@ def stage2_train(generator, discriminator, train_dataloader, optimizer, epoch, d
     # Set gradient clipping
     torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
     
-    return total_g_loss / len(train_dataloader), total_a_loss / len(train_dataloader), total_d_loss / len(train_dataloader), total_q_loss / len(train_dataloader)
+    return total_g_loss / len(train_dataloader), total_a_loss / len(train_dataloader), total_d_loss / len(train_dataloader), total_q_loss / len(train_dataloader), total_p_loss / len(train_dataloader)
 
 
 
@@ -720,7 +724,7 @@ def main(args):
             config=args,
             name=run_name,
             resume="allow",
-            # mode="disabled"
+            mode="disabled"
         )
     
     # Make sure wandb is initialized before proceeding
@@ -903,7 +907,7 @@ def main(args):
                             save_thread.join()
                             logger.info(f"Rank 0: Checkpoint saving completed")
                     else:
-                        train_g_loss, train_a_loss, train_d_loss, train_q_loss = stage1_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator, phase=2)
+                        train_g_loss, train_a_loss, train_d_loss, train_q_loss, train_p_loss = stage1_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator, phase=2)
                         # Run validation every 10 epochs
                         if epoch % 10 == 0:
                             generator.eval()
@@ -923,6 +927,7 @@ def main(args):
                                 'epoch_train_a_loss': train_a_loss,
                                 'epoch_train_d_loss': train_d_loss,
                                 'epoch_train_q_loss': train_q_loss,
+                                'epoch_train_p_loss': train_p_loss,
                                 'epoch_val_loss': val_loss,
                             })
                             
@@ -952,7 +957,7 @@ def main(args):
             for epoch in range(start_epoch, args.num_epochs_2):
                 with autocast():
                     generator.train()
-                    train_g_loss, train_a_loss, train_d_loss, train_q_loss = stage2_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
+                    train_g_loss, train_a_loss, train_d_loss, train_q_loss, train_p_loss = stage2_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
                     # Run validation every 10 epochs
                     if epoch % 10 == 0:
                         generator.eval()
@@ -972,6 +977,7 @@ def main(args):
                             'epoch_train_a_loss': train_a_loss,
                             'epoch_train_d_loss': train_d_loss,
                             'epoch_train_q_loss': train_q_loss,
+                            'epoch_train_p_loss': train_p_loss,
                             'epoch_val_loss': val_loss,
                         })
                         

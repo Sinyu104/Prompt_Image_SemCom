@@ -50,7 +50,7 @@ python3 -c "import torch; torch.cuda.empty_cache()"
 TRAIN_CMD="accelerate launch \
     --num_processes $NUM_GPUS \
     --mixed_precision fp16 \
-    --gradient_accumulation_steps 1 \
+    --gradient_accumulation_steps 8 \
     --num_machines 1 \
     main.py \
     --textalign\

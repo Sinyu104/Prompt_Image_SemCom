@@ -23,6 +23,9 @@ export OMP_NUM_THREADS=8  # Parallel operations
 export MKL_NUM_THREADS=8  # Intel MKL parallelism
 export NUMEXPR_NUM_THREADS=8  # NumExpr parallelism
 
+export NCCL_TIMEOUT=900            # allow up to 15 minutes
+export NCCL_LAUNCH_TIMEOUT=600     # up to 10 minutes for the launch handshake
+
 
 
 # Set initial batch size (will be divided by number of GPUs)

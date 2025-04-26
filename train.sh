@@ -1,19 +1,20 @@
 #!/bin/bash
 
 # Set environment variables
-export CUDA_VISIBLE_DEVICES=2  # Use all 4 GPUs
+export CUDA_VISIBLE_DEVICES=0,1,2,3  # Use all 4 GPUs
 export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128,garbage_collection_threshold:0.6"
 export TORCH_DISTRIBUTED_DEBUG=DETAIL  # Add debug info
 export NCCL_DEBUG=WARNING
-export NCCL_P2P_DISABLE=1  # Disable P2P if causing issues
 export CUDA_LAUNCH_BLOCKING=1  # More synchronous CUDA operations
+export NCCL_DEBUG=INFO
+export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_SOCKET_IFNAME=eth2
 # Try different network interfaces or let NCCL auto-detect
 # Fall back to TCP if needed
-export NCCL_IB_DISABLE=1
-export NCCL_NET_GDR_LEVEL=0  # Disable RDMA
 # Add more NCCL settings for stability
 export NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_SOCKET_NTHREADS=4
+export TORCH_DISTRIBUTED_BACKEND=nccl
 # Memory management
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_CACHE_DISABLE=1
@@ -25,16 +26,18 @@ export NUMEXPR_NUM_THREADS=8  # NumExpr parallelism
 
 
 # Set initial batch size (will be divided by number of GPUs)
-TOTAL_BATCH_SIZE=1  # Further reduce batch size
-NUM_GPUS=1
+TOTAL_BATCH_SIZE=4  # Further reduce batch size
+NUM_GPUS=4
 PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 
 # Directory paths
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
 # OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="$HOME/prompt_image_segment/outputs/stage2_LLava_nonanimal_animal_$(date +%Y%m%d_%H%M%S)"
-RESUME_DIR="$HOME/prompt_image_segment/outputs/stage2_nonanimal_animal_20250415_153515/checkpoints/checkpoint_epoch_25_loss_2.2182.pth"
-# RESUME_DIR=None
+RESUME_GEN_DIR="$HOME/prompt_image_segment/outputs/stage2_nonanimal_animal_20250415_153515/checkpoints/generator_epoch25_loss_2.2182.pth"
+# RESUME_DIS_DIR="$HOME/prompt_image_segment/outputs/stage2_LLava_nonanimal_animal_20250426_010234/checkpoints/discriminator_epoch66_loss1.2128.pth"
+# RESUME_GEN_DIR=None
+RESUME_DIS_DIR=None
 STORE_DIR="$HOME/prompt_image_segment/stored_data/Traditional_SNR10"
 
 # Create output directory
@@ -61,7 +64,7 @@ TRAIN_CMD="accelerate launch \
     --num_epochs_2 100 \
     --num_epochs_3 100 \
     --start_epoch 0\
-    --start_stage 1 \
+    --start_stage 2 \
     --learning_rate_g 1e-4 \
     --learning_rate_d 1e-5 \
     --learning_rate_w 1e-4 \
@@ -82,7 +85,8 @@ TRAIN_CMD="accelerate launch \
     --sample_interval 100 \
     --train_category nonanimal \
     --val_category animal \
-    --resume_from_checkpoint $RESUME_DIR\
+    --resume_generator_checkpoint $RESUME_GEN_DIR\
+    --resume_discriminator_checkpoint $RESUME_DIS_DIR\
     --generated_data_dir $STORE_DIR"
 
 # Execute the training command

@@ -1830,7 +1830,7 @@ class LLavaAnswerGenerationModel(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.llava = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.float32,
             trust_remote_code=True,
             low_cpu_mem_usage=True,
         ).to(self.device)

@@ -50,7 +50,25 @@ from utils import (
     save_reconstructed_image
 )
 import math
+import socket, psutil
 
+def pick_real_interface():
+    """
+    Return the first non-loopback, non-link-local IPv4 interface name,
+    or None if none found.
+    """
+    for iface, addrs in psutil.net_if_addrs().items():
+        for addr in addrs:
+            if addr.family == socket.AF_INET:
+                ip = addr.address
+                # skip loopback and link-local
+                if ip.startswith("127.") or ip.startswith("169.254."):
+                    continue
+                # we’ve found a usable interface!
+                print(f"Using interface {iface} with IP {ip}")
+                return iface
+    print("No non-loopback interface found")
+    return None
 
 def calculate_segmentation_loss(pred_masks, target_masks):
     """Calculate segmentation loss using binary cross entropy"""
@@ -546,7 +564,7 @@ def stage2_train(generator, discriminator, train_dataloader, optimizer, epoch, d
             total_g_loss += g_loss.item()   # Track generator loss
             total_a_loss += g_loss_adv.item()   # Track VGG loss
             total_d_loss += d_loss.item()  # Track discriminator loss
-            total_q_loss += outputs['loss_perc'].item() # Track LLaVA loss
+            total_p_loss += outputs['loss_perc'].item() # Track LLaVA loss
             total_q_loss += outputs['quantization_loss'].item()   # Track quantization loss
             
             # Update progress bar on main process
@@ -664,9 +682,12 @@ def main(args):
         valid_interface = ''.join([chr(i) for i in interface_tensor.tolist() if i != 0])
     
     # Set NCCL socket interface
+    # Only set NCCL_SOCKET_IFNAME if we actually discovered one
+    valid_interface = pick_real_interface()
     if valid_interface:
         os.environ["NCCL_SOCKET_IFNAME"] = valid_interface
-        print(f"Using network interface: {valid_interface}")
+    else:
+        print("Warning: falling back to NCCL auto-detect")
     
     # Load configuration from config.json
     config = ModelConfig.from_json("config.json")
@@ -678,25 +699,13 @@ def main(args):
     device = torch.device(f'cuda:{local_rank}' if local_rank != -1 else 'cuda')
     
     # Initialize process group with TCP backend as fallback
-    try:
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-        
-        # Try NCCL first with explicit socket interface
-        torch.distributed.init_process_group(
-            backend="nccl",
-            init_method="env://",
-            timeout=timedelta(minutes=5)
-        )
-    except Exception as e:
-        print(f"NCCL initialization failed: {e}")
-        print("Falling back to TCP backend...")
-        # Fall back to TCP backend
-        torch.distributed.init_process_group(
-            backend="gloo",
-            init_method="env://",
-            timeout=timedelta(minutes=5)
-        )
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+    torch.distributed.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        timeout=timedelta(minutes=5)
+    )
     
     # Configure FSDP Plugin
     fsdp_plugin = FullyShardedDataParallelPlugin(
@@ -713,6 +722,7 @@ def main(args):
         mixed_precision=args.mixed_precision,
         fsdp_plugin=fsdp_plugin,
         device_placement=True,
+        split_batches=False,           # don’t split batches across devices
     )
     
     # Initialize wandb only on the main process
@@ -724,7 +734,7 @@ def main(args):
             config=args,
             name=run_name,
             resume="allow",
-            mode="disabled"
+            # mode="disabled"
         )
     
     # Make sure wandb is initialized before proceeding
@@ -793,12 +803,18 @@ def main(args):
     # Load checkpoint if it exists
     start_epoch = args.start_epoch
     best_loss = float('inf')
-    if args.resume_from_checkpoint and os.path.exists(args.resume_from_checkpoint):
-        load_checkpoint(generator, optimizer_G, args.resume_from_checkpoint, device)
-        
+    if args.resume_generator_checkpoint and os.path.exists(args.resume_generator_checkpoint):
+        load_checkpoint(generator, args.resume_generator_checkpoint, device)
         # Override loaded start_epoch if specified in args
         if args.start_epoch > 0:
             start_epoch = args.start_epoch
+    
+    if args.resume_discriminator_checkpoint and os.path.exists(args.resume_discriminator_checkpoint):
+        load_checkpoint(discriminator, args.resume_discriminator_checkpoint, device)
+        # Override loaded start_epoch if specified in args
+        if args.start_epoch > 0:
+            start_epoch = args.start_epoch
+        
 
     
     # Prepare dataloaders
@@ -932,21 +948,39 @@ def main(args):
                             })
                             
                             # Save checkpoint asynchronously
-                            logger.info(f"Saving checkpoint with val_loss: {val_loss}")
-                            save_thread = threading.Thread(
+                            logger.info(f"Saving generator checkpoint for epoch {epoch} with val_loss: {val_loss}")
+                            gen_save_thread = threading.Thread(
                                 target=save_checkpoint,
                                 args=(
                                     generator.module if hasattr(generator, "module") else generator,
+                                    'generator',
                                     epoch,
-                                    val_loss,  # Make sure this is not None
+                                    val_loss,
                                     args
                                 )
                             )
-                            save_thread.start()
+
+                            logger.info(f"Saving discriminator checkpoint for epoch {epoch} with val_loss: {val_loss}")
+                            disc_save_thread = threading.Thread(
+                                target=save_checkpoint,
+                                args=(
+                                    discriminator.module if hasattr(discriminator, "module") else discriminator,
+                                    'discriminator',
+                                    epoch,
+                                    val_loss,
+                                    args
+                                )
+                            )
+
+                            gen_save_thread.start()
+                            logger.info(f"generator thread alive after start? {gen_save_thread.is_alive()}")
+                            disc_save_thread.start()
+                            logger.info(f"discriminator thread alive after start? {disc_save_thread.is_alive()}")
                             
                             # Wait for saving to complete before synchronization
-                            save_thread.join()
-                            logger.info(f"Rank 0: Checkpoint saving completed")
+                            gen_save_thread.join()
+                            disc_save_thread.join()
+                            logger.info(f"Checkpoint saving completed")
                   
                 torch.cuda.empty_cache()  # Clear memory before synchronization
                 
@@ -982,20 +1016,36 @@ def main(args):
                         })
                         
                         # Save checkpoint asynchronously
-                        logger.info(f"Saving checkpoint with val_loss: {val_loss}")
-                        save_thread = threading.Thread(
+                        logger.info(f"Saving generator checkpoint for epoch {epoch} with val_loss: {val_loss}")
+                        gen_save_thread = threading.Thread(
                             target=save_checkpoint,
                             args=(
                                 generator.module if hasattr(generator, "module") else generator,
+                                'generator',
                                 epoch,
-                                val_loss,  # Make sure this is not None
+                                val_loss,
                                 args
                             )
                         )
-                        save_thread.start()
+
+                        logger.info(f"Saving discriminator checkpoint for epoch {epoch} with val_loss: {val_loss}")
+                        disc_save_thread = threading.Thread(
+                            target=save_checkpoint,
+                            args=(
+                                discriminator.module if hasattr(discriminator, "module") else discriminator,
+                                'discriminator',
+                                epoch,
+                                val_loss,
+                                args
+                            )
+                        )
+
+                        gen_save_thread.start()
+                        disc_save_thread.start()
                         
                         # Wait for saving to complete before synchronization
-                        save_thread.join()
+                        gen_save_thread.join()
+                        disc_save_thread.join()
                         logger.info(f"Rank 0: Checkpoint saving completed")
                 
             torch.cuda.empty_cache()  # Clear memory before synchronization

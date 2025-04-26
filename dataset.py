@@ -354,6 +354,7 @@ def create_vqa_dataloaders(args):
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=True,
+        drop_last=True,
         collate_fn=collate_fn
     )
     
@@ -364,6 +365,7 @@ def create_vqa_dataloaders(args):
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=True,
+        drop_last=True,
         collate_fn=collate_fn
     )
     

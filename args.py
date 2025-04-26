@@ -46,7 +46,8 @@ def parse_args():
     parser.add_argument("--generated_data_dir", type=str, default="generated data dir")
     parser.add_argument('--data_dir', type=str, required=True, help='Path to VQA v2 dataset')
     parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--resume_from_checkpoint', type=str, default=None)
+    parser.add_argument('--resume_generator_checkpoint', type=str, default=None)
+    parser.add_argument('--resume_discriminator_checkpoint', type=str, default=None)
     
     # Loss weights
     parser.add_argument('--lambda_sparsity', type=float, default=0.1)

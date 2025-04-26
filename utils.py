@@ -15,6 +15,7 @@ import base64
 from torchvision.utils import save_image
 from io import BytesIO
 from PIL import Image
+import glob
 
 def setup_logger(args):
     """Setup logger with file and console handlers"""
@@ -73,91 +74,80 @@ def print_memory_stats():
             logger.info(f"Memory Reserved: {torch.cuda.memory_reserved(i) / 1e9:.2f} GB")
     return ""
 
-def save_checkpoint(model, epoch, loss, args):
-    """Save model checkpoint and keep only the latest two."""
+def save_checkpoint(model, model_name, epoch, loss, args):
+    """
+    Save only the trainable parameters of `model` under `model_name`,
+    unwraps .module if present, and keeps only the 2 most recent checkpoints.
+    """
     logger = logging.getLogger('training')
-    try:
-        logger.info("Saving checkpoint...")
-        
-        model_state_dict = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                model_state_dict[name] = param.cpu()
-        
-        logger.info("Number of parameters being saved: %d", len(model_state_dict))
-        
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': model_state_dict,
-            'loss': loss,
-        }
+    # 1) unwrap if wrapped
+    to_save = model.module if hasattr(model, "module") else model
 
-        save_dir = os.path.join(args.output_dir, 'checkpoints')
-        os.makedirs(save_dir, exist_ok=True)
+    # 2) collect only trainable params
+    trainable_state = {
+        name: param.detach().cpu()
+        for name, param in to_save.named_parameters()
+        if param.requires_grad
+    }
+    logger.info(f"[{model_name}] trainable params: {len(trainable_state)} tensors")
 
-        checkpoint_path = os.path.join(
-            save_dir,
-            f'checkpoint_epoch_{epoch}_loss_{loss:.4f}.pth'
-        )
-        
-        torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Successfully saved checkpoint to {checkpoint_path}")
-        
-        # Keep only the latest two checkpoints
-        checkpoints = [f for f in os.listdir(save_dir) if f.startswith('checkpoint')]
-        for ckpt in checkpoints:
-            ckpt_epoch = int(ckpt.split('_')[2])
-            if ckpt_epoch <= epoch - 2:
-                os.remove(os.path.join(save_dir, ckpt))
-                logger.info(f"Removed old checkpoint {ckpt}")
-        
-    except Exception as e:
-        logger.error(f"Error saving checkpoint: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    checkpoint = {
+        "epoch":      epoch,
+        "loss":       loss,
+        "model_state_dict": trainable_state,
+    }
 
-def load_checkpoint(model, optimizer, checkpoint_path, device):
-    """Load model checkpoint."""
+    # 3) write out
+    save_dir = os.path.join(args.output_dir, "checkpoints")
+    os.makedirs(save_dir, exist_ok=True)
+    path = os.path.join(save_dir, f"{model_name}_epoch{epoch}_loss{loss:.4f}.pth")
+    torch.save(checkpoint, path)
+    logger.info(f"[{model_name}] saved to {path}")
+
+    # 4) prune old by modification time (keep only latest two)
+    pattern = os.path.join(save_dir, f"{model_name}_epoch*.pth")
+    ckpts = sorted(glob.glob(pattern), key=os.path.getmtime)
+    for old in ckpts[:-2]:
+        os.remove(old)
+        logger.info(f"[{model_name}] removed old checkpoint {os.path.basename(old)}")
+
+
+
+
+def load_checkpoint(model, checkpoint_path, device):
+    """
+    Load only the trainable parameters saved at `checkpoint_path` into `model`,
+    unwraps .module if present, strips any 'module.' prefixes, and returns
+    (start_epoch, best_loss).  Everything else remains frozen as in the model.
+    """
     logger = logging.getLogger('training')
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        start_epoch = checkpoint['epoch']
-        best_loss = checkpoint['loss']
-        logger.info(f"Loading checkpoint from {checkpoint_path} - start_epoch: {start_epoch}, best_loss: {best_loss}")
-        
-        current_state = model.state_dict()
-        
-        if 'model_state_dict' in checkpoint:
-            state_dict_key = 'model_state_dict'
-        else:
-            raise KeyError("No model state dict found in checkpoint")
-        
-        # Load only matching parameters
-        matched_state_dict = {}
-        for key, v in checkpoint[state_dict_key].items():
-            if key in current_state:
-                if current_state[key].shape == v.shape:
-                    matched_state_dict[key] = v
-                else:
-                    logger.warning(f"Skipping parameter {key} due to shape mismatch: "
-                                 f"checkpoint={v.shape}, model={current_state[key].shape}")
-            else:
-                logger.warning(f"Parameter {key} not found in current model")
-        
-        model.load_state_dict(matched_state_dict, strict=False)
-        
-        # Skip loading optimizer state when architecture changes
-        logger.info("Skipping optimizer state due to architecture change")
-            
-        logger.info(f"Loaded {len(matched_state_dict)} matching parameters")
-        
-        return start_epoch, best_loss
-        
-    except Exception as e:
-        logger.error(f"Error loading checkpoint: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return 0, float('inf')
+    # unwrap if wrapped
+    base = model.module if hasattr(model, "module") else model
+
+    logger.info(f"Loading checkpoint from {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    start_epoch = ckpt.get("epoch", 0)
+    best_loss   = ckpt.get("loss", float("inf"))
+    raw_state   = ckpt["model_state_dict"]
+
+    # strip `module.` prefix if any
+    fixed_state = { k.replace("module.", ""): v
+                    for k, v in raw_state.items() }
+
+    # load only these keys (strict=False will skip everything else)
+    missing, unexpected = base.load_state_dict(fixed_state, strict=False)
+    # get the set of parameter names you actually saved
+    saved_param_keys = set(fixed_state.keys())
+
+    # filter missing to only those that were supposed to come from your checkpoint
+    missing_params = [k for k in missing if k in saved_param_keys]
+    if missing_params:
+        logger.warning(f"Missing tuned params: {missing_params}")
+    if unexpected:
+        logger.warning(f"Unexpected keys in checkpoint: {unexpected}")
+
+    logger.info(f"Loaded epoch {start_epoch}, best_loss={best_loss:.4f}")
+    return start_epoch, best_loss
 
 def setup_distributed_training(args):
     """Setup distributed training"""

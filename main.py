@@ -832,16 +832,25 @@ def main(args):
         if args.traditional:
             jpg = JPGTransmission(args, device=device)
             total_u_loss = 0
+            num_batches = 0
             for batch_idx, batch in enumerate(tqdm(val_dataloader, desc="Evaluating JPG")):
                 # Assume batch['image'] is a tensor of shape (B, C, H, W) with values in [0, 1]
                 batch_size = batch['image'].shape[0] 
-                
+                num_batches += 1
                 
                 # Process each image in the batch individually
                 for i in range(batch_size):
                     u_loss = jpg(batch['image'][i], batch['question'][i], batch['answer_text'][i], batch['image_id'][i])  # calls the forward() method of JPGTransmission
                     total_u_loss += u_loss.item()
-            print("Average u_loss : ", total_u_loss/len(val_dataloader))
+            t_loss    = torch.tensor(total_u_loss,    dtype=torch.float32, device=device)
+            n_batches = torch.tensor(num_batches,   dtype=torch.float32, device=device)
+            # avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+            torch.distributed.all_reduce(t_loss,    op=dist.ReduceOp.SUM)
+            torch.distributed.all_reduce(n_batches, op=dist.ReduceOp.SUM)
+            global_avg_loss = t_loss / n_batches
+            if torch.distributed.get_rank() == 0:
+                print(f"Aaverage loss: {global_avg_loss.item():.4f}")
+            return global_avg_loss.item()
                 
         if args.eval:
             total_loss = 0
@@ -869,10 +878,15 @@ def main(args):
                                     save_path,
                                     batch['image_id'][i].item() if torch.is_tensor(batch['image_id'][i]) else batch['image_id'][i],
                                 )
-
-            avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
-            print("The average loss is : ", avg_loss)
-            return avg_loss
+            t_loss    = torch.tensor(total_loss,    dtype=torch.float32, device=device)
+            n_batches = torch.tensor(num_batches,   dtype=torch.float32, device=device)
+            # avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+            torch.distributed.all_reduce(t_loss,    op=dist.ReduceOp.SUM)
+            torch.distributed.all_reduce(n_batches, op=dist.ReduceOp.SUM)
+            global_avg_loss = t_loss / n_batches
+            if torch.distributed.get_rank() == 0:
+                print(f"Aaverage loss: {global_avg_loss.item():.4f}")
+            return global_avg_loss.item()
 
 
         if args.start_stage == 1:

@@ -7,6 +7,7 @@ from torch import nn
 from model import LLavaAnswerGenerationModel
 from utils import store_generated_outputs
 from torchvision.transforms import ToPILImage, ToTensor
+from types import MethodType
 
 import matplotlib.pyplot as plt
 
@@ -248,9 +249,10 @@ class JPGTransmission(nn.Module):
 
         self.perceptual_model = LLavaAnswerGenerationModel(
             model_path="qnguyen3/nanoLLaVA-1.5",
-            load_in_8bit=False,
             device=self.device
-        )
+        ).to(self.device)
+
+        self.perceptual_model.eval()
 
         # Reconstruction Loss (e.g., L1 Loss)
         self.recon_loss = nn.L1Loss()
@@ -302,6 +304,12 @@ class JPGTransmission(nn.Module):
             # save_image_comparison(input_image, received_image, self.generated_data_dir, image_id)
         
         # Compute perceptual loss between the original and received images.
-        perceptual_loss = self.perceptual_model(input_image, received_image, question, answer)['loss_perc']
+        if input_image.dim() == 3:
+            input_image = input_image.unsqueeze(0)
+        if received_image.dim() == 3:
+            received_image = received_image.unsqueeze(0)
+        received_image = received_image.to(input_image.device)
+        with torch.no_grad():
+            perc_loss  = self.perceptual_model(input_image, received_image, [question])["loss_perc"]
 
-        return perceptual_loss
+        return perc_loss

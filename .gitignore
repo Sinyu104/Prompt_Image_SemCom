@@ -26,6 +26,7 @@ split_cache/
 plot*
 copy_to_cc.sh
 channel_eval.py
+stored_data/
 *.pth
 *.ckpt
 *.pt

@@ -36,12 +36,12 @@ PER_GPU_BATCH_SIZE=$((TOTAL_BATCH_SIZE / NUM_GPUS))
 # Directory paths
 DATA_DIR="$HOME/prompt_image_segment/VQAv2"
 # OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_codebook_reduce_dim_512_$(date +%Y%m%d_%H%M%S)"
-OUTPUT_DIR="$HOME/prompt_image_segment/outputs/stage2_LLava_nonanimal_animal_$(date +%Y%m%d_%H%M%S)"
-RESUME_GEN_DIR="$HOME/prompt_image_segment/outputs/stage2_nonanimal_animal_20250415_153515/checkpoints/generator_epoch25_loss_2.2182.pth"
-# RESUME_DIS_DIR="$HOME/prompt_image_segment/outputs/stage2_LLava_nonanimal_animal_20250426_010234/checkpoints/discriminator_epoch66_loss1.2128.pth"
-# RESUME_GEN_DIR=None
+OUTPUT_DIR="$HOME/prompt_image_segment/outputs/debug_nonanimal_animal_$(date +%Y%m%d_%H%M%S)"
+# RESUME_GEN_DIR="$HOME/prompt_image_segment/outputs/stage2_LLava_nonanimal_animal_20250426_034417/checkpoints/generator_epoch10_loss0.3137.pth"
+# RESUME_DIS_DIR="$HOME/prompt_image_segment/outputs/stage2_LLava_nonanimal_animal_20250426_034417/checkpoints/discriminator_epoch10_loss0.3137.pth"
+RESUME_GEN_DIR=None
 RESUME_DIS_DIR=None
-STORE_DIR="$HOME/prompt_image_segment/stored_data/Traditional_SNR10"
+STORE_DIR="$HOME/prompt_image_segment/stored_data/Traditional_SNR8_animal"
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -83,14 +83,17 @@ TRAIN_CMD="accelerate launch \
     --loss_quant 0.5 \
     --loss_gen 1.0 \
     --loss_disc 0.5 \
-    --SNR 40.0 \
+    --SNR 8.0 \
     --log_interval 1000 \
     --sample_interval 100 \
     --train_category nonanimal \
     --val_category animal \
     --resume_generator_checkpoint $RESUME_GEN_DIR\
     --resume_discriminator_checkpoint $RESUME_DIS_DIR\
-    --generated_data_dir $STORE_DIR"
+    --generated_data_dir $STORE_DIR \
+    --store_gen_data\
+    --traditional\
+    --eval"
 
 # Execute the training command
 eval $TRAIN_CMD

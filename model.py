@@ -1898,14 +1898,22 @@ class LLavaAnswerGenerationModel(nn.Module):
 
         # ------------------------------------------------------------------
         # slice image tokens and cosine perceptual loss
-        txt_len = input_ids.shape[1]                     #  <<< was toks.input_ids
-        total   = ref_out.hidden_states[-1].shape[1]
-        img_tok = total - txt_len
-        ref_feat = ref_out.hidden_states[-1][:, :img_tok, :]
-        gen_feat = gen_out.hidden_states[-1][:, :img_tok, :]
-        ref_feat = F.normalize(ref_feat, dim=-1)
-        gen_feat = F.normalize(gen_feat, dim=-1)
-        loss = 1.0 - (ref_feat * gen_feat).sum(dim=-1).mean()
+        layers = [6, 12, 18, -1]  # for example
+
+        loss = 0.0
+        for idx in layers:
+            # grab hidden‐states at that depth: shape (B, seq_len, D)
+            h_ref = ref_out.hidden_states[idx]
+            h_gen = gen_out.hidden_states[idx]
+
+            # L2-normalize along the feature dimension
+            h_ref = F.normalize(h_ref, dim=-1)
+            h_gen = F.normalize(h_gen, dim=-1)
+
+            # compute cosine per token, then average over tokens & batch
+            cos_per_token = (h_ref * h_gen).sum(dim=-1)   # (B, seq_len)
+            loss         += (1.0 - cos_per_token).mean()  # scalar per layer
+
         return {"loss_perc": loss}
 
 

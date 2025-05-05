@@ -647,6 +647,8 @@ def train_weight_module(generator, discriminator, train_dataloader, optimizer, e
         total_regret = 0.0
         for batch_idx, batch in enumerate(train_dataloader):
             # Train Discriminator only on even batch indices
+            if batch_idx > 10:
+                break
             optimizer_W.zero_grad()
             with autocast(enabled=False):
                 outputs = generator.forward_with_regret(batch['image'], batch['question'], batch['answer_text'], stage=2, textalign=args.textalign)

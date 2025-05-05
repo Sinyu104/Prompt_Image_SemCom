@@ -647,8 +647,6 @@ def train_weight_module(generator, discriminator, train_dataloader, optimizer, e
         total_regret = 0.0
         for batch_idx, batch in enumerate(train_dataloader):
             # Train Discriminator only on even batch indices
-            if batch_idx > 0:
-                break
             optimizer_W.zero_grad()
             with autocast(enabled=False):
                 outputs = generator.forward_with_regret(batch['image'], batch['question'], batch['answer_text'], stage=2, textalign=args.textalign)
@@ -862,7 +860,7 @@ def main(args):
             config=args,
             name=run_name,
             resume="allow",
-            mode="disabled"
+            # mode="disabled"
         )
     
     # Make sure wandb is initialized before proceeding

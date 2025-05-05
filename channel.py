@@ -501,12 +501,16 @@ class PhysicalLayerModule(nn.Module):
             output_sequence = []
             self.channel.update_channel()      # update channel for current time step
             H = self.channel.get_channel()     # [K, Nr, Nt]
+            mean_weight = weight.mean(dim=0)
+            if is_main_process() :
+                print(f"mean_weight: {mean_weight}")
+            # Perform WMMSE optimization (updates precoder and combiner in-place)
+            self.wmmse_hybrid_beamforming(H, mean_weight, noise_var=self.noise_power)
             for t in range(T): 
                 s_t = modulated_grid[t]            # [K, Ns]
-                weight_t = weight[t]
+                # weight_t = weight[t]
                 s_t = s_t.unsqueeze(-1)            # [K, Ns, 1]
-                self.wmmse_hybrid_beamforming(H, weight_t, noise_var=self.noise_power)   # Perform WMMSE optimization (updates precoder and combiner in-place)
-
+                   
 
                 x_t = self.precoder(s_t)           # [K, Nt]
                 y_t = self.channel(x_t.unsqueeze(-1))  # [K, Nr]
@@ -529,7 +533,7 @@ class PhysicalLayerModule(nn.Module):
         return demodulate_symbol  # [T, K, Ns]
         # return output_grid
         
-    def wmmse_hybrid_beamforming(self, H, weight, noise_var=1e-3, num_iters=10):
+    def wmmse_hybrid_beamforming(self, H, weight, noise_var=1e-3, num_iters=3):
         """
         Perform the WMMSE optimization in two phases:
         Phase 1: Optimize precoders (digital & analog) with combiners fixed.

@@ -33,6 +33,8 @@ def parse_args():
                        help="Starting training stage: 1 (encoder-decoder), 2 (semantic-aware HBF), 3 (full fine-tuning)")
     parser.add_argument("--textalign", action="store_true", 
                        help="Enable text alignment")
+    parser.add_argument("--apply_weight", type=int, default=0, choices=[0,1],
+                       help="Apply weight to the SA-HBF")
     parser.add_argument("--store_gen_data", action="store_true", 
                        help="Whether to store generator data")
     parser.add_argument("--traditional", action="store_true", 
@@ -48,6 +50,7 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--resume_generator_checkpoint', type=str, default=None)
     parser.add_argument('--resume_discriminator_checkpoint', type=str, default=None)
+    parser.add_argument('--resume_weight_checkpoint', type=str, default=None)
     
     # Loss weights
     parser.add_argument('--lambda_sparsity', type=float, default=0.1)

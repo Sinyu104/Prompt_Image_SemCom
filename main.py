@@ -51,6 +51,7 @@ from utils import (
 )
 import math
 import socket, psutil
+from itertools import islice
 
 def pick_real_interface():
     """
@@ -286,7 +287,7 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
                 # Train Discriminator only on even batch indices
                 optimizer_G.zero_grad()
                 with autocast(enabled=False):
-                    outputs = generator(batch['image'], batch['question'], batch['answer_text'], stage=1)
+                    outputs = generator(batch['image'], batch['question'], batch['answer_text'], stage=1, textalign=args.textalign)
                     generated_images = outputs['generated_images']
                     generated_images = torch.clamp(generated_images, 0, 1)
         
@@ -357,7 +358,7 @@ def stage1_train(generator, discriminator, train_dataloader, optimizer, epoch, d
                 # Train Discriminator only on even batch indices
                 optimizer_G.zero_grad()
                 with autocast(enabled=False):
-                    outputs = generator(batch['image'], batch['question'], batch['answer_text'], stage=1)
+                    outputs = generator(batch['image'], batch['question'], batch['answer_text'], stage=1, textalign=args.textalign)
                     generated_images = outputs['generated_images']
                     generated_images = torch.clamp(generated_images, 0, 1)
                     # Compute the critic (discriminator) score on fake images
@@ -496,15 +497,6 @@ def stage2_train(generator, discriminator, train_dataloader, optimizer, epoch, d
    
     try:
 
-        if accelerator.is_main_process:
-            progress_bar = tqdm(
-                total=len(train_dataloader),
-                desc=f"Training Epoch {epoch}",
-                position=0,
-                leave=True,
-                file=sys.stdout
-            )
-
         total_g_loss = 0
         total_d_loss = 0
         total_a_loss = 0
@@ -515,7 +507,7 @@ def stage2_train(generator, discriminator, train_dataloader, optimizer, epoch, d
             # Train Discriminator only on even batch indices
             optimizer_G.zero_grad()
             with autocast(enabled=False):
-                outputs = generator(batch['image'], batch['question'], batch['answer_text'], stage=2)
+                outputs = generator(batch['image'], batch['question'], batch['answer_text'], stage=2, textalign=args.textalign)
                 generated_images = outputs['generated_images']
                 generated_images = torch.clamp(generated_images, 0, 1)
                 # Compute the critic (discriminator) score on fake images
@@ -617,7 +609,143 @@ def stage2_train(generator, discriminator, train_dataloader, optimizer, epoch, d
     return total_g_loss / len(train_dataloader), total_a_loss / len(train_dataloader), total_d_loss / len(train_dataloader), total_q_loss / len(train_dataloader), total_p_loss / len(train_dataloader)
 
 
+def train_weight_module(generator, discriminator, train_dataloader, optimizer, epoch, device, args, accelerator):
+    """
+    Stage 2 Training: Optimize RL-weighting agent (fix encoder/decoder).
+    
+    Args:
+        generator: the full model (encoder + decoder + rl_agent)
+        discriminator: not used in Stage 2 (optional)
+        train_dataloader: training data loader
+        optimizers: [optimizer_RL]
+        epoch: current epoch number
+        device: device
+        args: training args
+        accelerator: HuggingFace accelerator
+    Returns:
+        train_rl_loss: total loss for the RL agent (typically derived from task loss)
+    """
+    logger = logging.getLogger('training')
+    generator.train()
+    
 
+    optimizer_W = optimizer  # Unpack optimizers
+
+    # Create progress bar
+    if accelerator.is_main_process:
+        progress_bar = tqdm(
+            total=len(train_dataloader),
+            desc=f"Training Epoch {epoch}",
+            position=0,
+            leave=True,
+            file=sys.stdout
+        )
+   
+    try:
+
+        total_policy_loss = 0.0
+        total_regret = 0.0
+        for batch_idx, batch in enumerate(train_dataloader):
+            # Train Discriminator only on even batch indices
+            if batch_idx > 0:
+                break
+            optimizer_W.zero_grad()
+            with autocast(enabled=False):
+                outputs = generator.forward_with_regret(batch['image'], batch['question'], batch['answer_text'], stage=2, textalign=args.textalign)
+                generated_images_sample = outputs['generated_images_sample']
+                generated_images_sample = torch.clamp(generated_images_sample, 0, 1)
+                # Compute the critic (discriminator) score on fake images
+                fake_score_sample = discriminator(generated_images_sample)
+                # WGAN generator loss: maximize fake_score, so minimize negative score
+                g_loss_adv_sample = -fake_score_sample.mean()
+                logger.debug(f"g_loss_adv_sample : {g_loss_adv_sample.item()}, loss_perc_sample : {outputs['loss_perc_sample'].item()}, loss_vgg_sample : {outputs['loss_vgg_sample'].item()}, loss_quant_sample : {outputs['quantization_loss_sample'] .item()}")
+                
+                # Total generator loss: include reconstruction, VGG, adversarial (WGAN) and feature matching losses
+                g_loss_sample = (
+                    args.loss_recon * outputs['loss_recon_sample'] +
+                    args.loss_perc   * outputs['loss_perc_sample'] +
+                    args.loss_vgg   * outputs['loss_vgg_sample'] +
+                    args.loss_gen   * g_loss_adv_sample +
+                    args.loss_quant * outputs['quantization_loss_sample'] 
+                )
+                
+                generated_images_det = outputs['generated_images_det']
+                generated_images_det = torch.clamp(generated_images_det, 0, 1)
+                # Compute the critic (discriminator) score on fake images
+                fake_score_det = discriminator(generated_images_det)
+                # WGAN generator loss: maximize fake_score, so minimize negative score
+                g_loss_adv_det = -fake_score_det.mean()
+                logger.debug(f"g_loss_adv_det : {g_loss_adv_det.item()}, loss_perc_det : {outputs['loss_perc_det'].item()}, loss_vgg_det : {outputs['loss_vgg_det'].item()}, loss_quant_det : {outputs['quantization_loss_det'] .item()}")
+                
+                # Total generator loss: include reconstruction, VGG, adversarial (WGAN) and feature matching losses
+                g_loss_det = (
+                    args.loss_recon * outputs['loss_recon_det'] +
+                    args.loss_perc   * outputs['loss_perc_det'] +
+                    args.loss_vgg   * outputs['loss_vgg_det'] +
+                    args.loss_gen   * g_loss_adv_det +
+                    args.loss_quant * outputs['quantization_loss_det'] 
+                )
+                del g_loss_adv_det, generated_images_det, fake_score_det
+                torch.cuda.empty_cache()
+            # Compute regret
+            regret = (g_loss_sample - g_loss_det).detach()
+
+            # Retrieve log_probs from sample output
+            # assume out_sample['log_probs'] is a tensor of same shape as batch, sum over appropriate dims
+            B = batch['image'].size(0)
+            N = outputs['log_probs'].numel() // B
+            logp = outputs['log_probs'].view(B, N).mean(dim=1) # [B]
+            # Policy gradient loss
+            policy_loss = (regret * logp).mean()
+            accelerator.backward(policy_loss)
+            torch.nn.utils.clip_grad_norm_(generator.image_generation_model.weight_module.parameters(), max_norm=1.0)
+            optimizer_W.step()
+
+            total_policy_loss += policy_loss.item()
+            total_regret += regret.mean().item()
+
+            
+            # Update progress bar on main process
+            if accelerator.is_main_process:
+                progress_bar.set_postfix({
+                    'policy_loss': f"{policy_loss.item():.4f}",
+                    'regret': f"{regret.mean().item():.4f}"
+                })
+                progress_bar.update(1)
+            # Log batch statistics only on main process
+            if accelerator.is_main_process and batch_idx % args.log_interval == 0:
+                with torch.no_grad():
+                    visualize_batch(
+                        batch['image'][0],
+                        outputs['generated_images_det'],
+                        batch['question'][0],
+                        batch['answer_text'][0],
+                        epoch,
+                        batch_idx,
+                        args,
+                        mode='train'
+                    )
+                    torch.cuda.empty_cache()
+            
+            
+            # Synchronize after batch processing
+            accelerator.wait_for_everyone()
+            
+            if accelerator.is_main_process and batch_idx % args.log_interval == 0:
+                logger.debug(
+                    "Batch %d stats - PolicyLoss=%.4f, Regret=%.4f",
+                    batch_idx,
+                    policy_loss.item(),
+                    regret.item()
+                )
+    except Exception as e:
+        print(f"Error in train_epoch: {str(e)}")
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+        raise e
+    
+    
+    return total_policy_loss / batch_idx, total_regret / batch_idx
 
 
 def validate(generator, val_loader, epoch, device, args, accelerator, stage=1):
@@ -734,7 +862,7 @@ def main(args):
             config=args,
             name=run_name,
             resume="allow",
-            # mode="disabled"
+            mode="disabled"
         )
     
     # Make sure wandb is initialized before proceeding
@@ -814,6 +942,12 @@ def main(args):
         # Override loaded start_epoch if specified in args
         if args.start_epoch > 0:
             start_epoch = args.start_epoch
+
+    if args.resume_weight_checkpoint and os.path.exists(args.resume_weight_checkpoint):
+        load_checkpoint(generator.image_generation_model.weight_module, args.resume_weight_checkpoint, device)
+        # Override loaded start_epoch if specified in args
+        if args.start_epoch > 0:
+            start_epoch = args.start_epoch
         
 
     
@@ -866,6 +1000,8 @@ def main(args):
                 val_iter = tqdm(enumerate(val_dataloader), total=len(val_dataloader), desc="Evaluating", dynamic_ncols=True)
 
                 for batch_idx, batch in val_iter:
+                    if batch_idx > 100:
+                        break
                     with autocast():
                         outputs = generator(batch['image'], batch['question'], batch['answer_text'], stage=2)
                         total_loss += outputs['loss_perc'].item()
@@ -1002,70 +1138,125 @@ def main(args):
                 accelerator.wait_for_everyone() 
         elif args.start_stage == 2:
             logger.info("Starting training stage 2: Semantic-aware HBF")
-            for epoch in range(start_epoch, args.num_epochs_2):
-                with autocast():
-                    generator.train()
-                    train_g_loss, train_a_loss, train_d_loss, train_q_loss, train_p_loss = stage2_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
-                    # Run validation every 10 epochs
-                    if epoch % 10 == 0:
-                        generator.eval()
-                        val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator, stage=1)
-                        logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Train A loss: {train_a_loss:.4f}, Train D loss: {train_d_loss:.4f}, Val loss: {val_loss:.4f}")
-                    scheduler_G.step()
-                    scheduler_D.step()
-                    # Log learning rate
-                    if accelerator.is_main_process:
-                        current_lr_G = optimizer_G.param_groups[0]['lr']
-                        current_lr_D = optimizer_D.param_groups[0]['lr']
-                        wandb.log({
-                            'epoch': epoch,
-                            'learning_rate_G': current_lr_G,
-                            'learning_rate_D': current_lr_D,
-                            'epoch_train_g_loss': train_g_loss,
-                            'epoch_train_a_loss': train_a_loss,
-                            'epoch_train_d_loss': train_d_loss,
-                            'epoch_train_q_loss': train_q_loss,
-                            'epoch_train_p_loss': train_p_loss,
-                            'epoch_val_loss': val_loss,
-                        })
-                        
-                        # Save checkpoint asynchronously
-                        logger.info(f"Saving generator checkpoint for epoch {epoch} with val_loss: {val_loss}")
-                        gen_save_thread = threading.Thread(
-                            target=save_checkpoint,
-                            args=(
-                                generator.module if hasattr(generator, "module") else generator,
-                                'generator',
-                                epoch,
-                                val_loss,
-                                args
-                            )
-                        )
+            if args.apply_weight==1:
+                generator.train()
+                for p in generator.image_generation_model.weight_module.parameters():
+                    p.requires_grad = False
+                for p in discriminator.parameters():
+                    p.requires_grad = False
 
-                        logger.info(f"Saving discriminator checkpoint for epoch {epoch} with val_loss: {val_loss}")
-                        disc_save_thread = threading.Thread(
-                            target=save_checkpoint,
-                            args=(
-                                discriminator.module if hasattr(discriminator, "module") else discriminator,
-                                'discriminator',
-                                epoch,
-                                val_loss,
-                                args
+                for epoch in range(start_epoch, args.num_epochs_2):
+                    with autocast():
+                        generator.train()
+                        total_policy_loss, total_regret = train_weight_module(generator, discriminator, train_dataloader, optimizer_W, epoch, device, args, accelerator)
+                        # Run validation every 10 epochs
+                        val_loss = 0.0
+                        # if epoch % 10 == 0:
+                        #     generator.zero_grad(set_to_none=True)
+                        #     generator.eval()
+                        #     val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator, stage=2)
+                        #     logger.info(f"Epoch {epoch} - total_policy_loss: {total_policy_loss:.4f}, total_regret: {total_regret:.4f}")
+                        scheduler_W.step()
+                        if accelerator.is_main_process:
+                            current_lr_W = optimizer_W.param_groups[0]['lr']
+                            wandb.log({
+                                'epoch': epoch,
+                                'learning_rate_W': current_lr_W,
+                                'total_policy_loss': total_policy_loss,
+                                'total_regret': total_regret,
+                                'epoch_val_loss': val_loss,
+                            })
+                            
+                            # Save checkpoint asynchronously
+                            logger.info(f"Saving weight checkpoint for epoch {epoch} with val_loss: {val_loss}")
+                            save_thread = threading.Thread(
+                                target=save_checkpoint,
+                                args=(
+                                    generator.image_generation_model.weight_module.module if hasattr(generator.image_generation_model.weight_module, "module") else generator.image_generation_model.weight_module,
+                                    'weight_module',
+                                    epoch,
+                                    val_loss,
+                                    args
+                                )
                             )
-                        )
 
-                        gen_save_thread.start()
-                        disc_save_thread.start()
-                        
-                        # Wait for saving to complete before synchronization
-                        gen_save_thread.join()
-                        disc_save_thread.join()
-                        logger.info(f"Rank 0: Checkpoint saving completed")
+
+                            save_thread.start()
+                            
+                            # Wait for saving to complete before synchronization
+                            save_thread.join()
+                            logger.info(f"Rank 0: Checkpoint saving completed")
+                    
+                torch.cuda.empty_cache()  # Clear memory before synchronization
                 
-            torch.cuda.empty_cache()  # Clear memory before synchronization
-            
-            # All processes wait here once per epoch with longer timeout
-            accelerator.wait_for_everyone() 
+                # All processes wait here once per epoch with longer timeout
+                accelerator.wait_for_everyone() 
+
+            else:
+                for epoch in range(start_epoch, args.num_epochs_2):
+                    with autocast():
+                        generator.train()
+                        train_g_loss, train_a_loss, train_d_loss, train_q_loss, train_p_loss = stage2_train(generator, discriminator, train_dataloader, [optimizer_G, optimizer_D], epoch, device, args, accelerator)
+                        # Run validation every 10 epochs
+                        if epoch % 10 == 0:
+                            generator.eval()
+                            val_loss = validate(generator, val_dataloader, epoch, device, args, accelerator, stage=2)
+                            logger.info(f"Epoch {epoch} - Train G loss: {train_g_loss:.4f}, Train A loss: {train_a_loss:.4f}, Train D loss: {train_d_loss:.4f}, Val loss: {val_loss:.4f}")
+                        scheduler_G.step()
+                        scheduler_D.step()
+                        # Log learning rate
+                        if accelerator.is_main_process:
+                            current_lr_G = optimizer_G.param_groups[0]['lr']
+                            current_lr_D = optimizer_D.param_groups[0]['lr']
+                            wandb.log({
+                                'epoch': epoch,
+                                'learning_rate_G': current_lr_G,
+                                'learning_rate_D': current_lr_D,
+                                'epoch_train_g_loss': train_g_loss,
+                                'epoch_train_a_loss': train_a_loss,
+                                'epoch_train_d_loss': train_d_loss,
+                                'epoch_train_q_loss': train_q_loss,
+                                'epoch_train_p_loss': train_p_loss,
+                                'epoch_val_loss': val_loss,
+                            })
+                            
+                            # Save checkpoint asynchronously
+                            logger.info(f"Saving generator checkpoint for epoch {epoch} with val_loss: {val_loss}")
+                            gen_save_thread = threading.Thread(
+                                target=save_checkpoint,
+                                args=(
+                                    generator.module if hasattr(generator, "module") else generator,
+                                    'generator',
+                                    epoch,
+                                    val_loss,
+                                    args
+                                )
+                            )
+
+                            logger.info(f"Saving discriminator checkpoint for epoch {epoch} with val_loss: {val_loss}")
+                            disc_save_thread = threading.Thread(
+                                target=save_checkpoint,
+                                args=(
+                                    discriminator.module if hasattr(discriminator, "module") else discriminator,
+                                    'discriminator',
+                                    epoch,
+                                    val_loss,
+                                    args
+                                )
+                            )
+
+                            gen_save_thread.start()
+                            disc_save_thread.start()
+                            
+                            # Wait for saving to complete before synchronization
+                            gen_save_thread.join()
+                            disc_save_thread.join()
+                            logger.info(f"Rank 0: Checkpoint saving completed")
+                    
+                torch.cuda.empty_cache()  # Clear memory before synchronization
+                
+                # All processes wait here once per epoch with longer timeout
+                accelerator.wait_for_everyone() 
 
 
         elif args.start_stage == 3:

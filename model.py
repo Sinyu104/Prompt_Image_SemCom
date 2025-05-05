@@ -46,6 +46,7 @@ from torchvision.transforms.functional import to_pil_image
 import types
 from contextlib import suppress
 import importlib
+from torch.distributions import Dirichlet
 
 logger = logging.get_logger(__name__)
 
@@ -142,6 +143,7 @@ class CLIPSegImageSegmentationOutput(ModelOutput):
     pooled_output: torch.FloatTensor = None
     vision_model_output: BaseModelOutputWithPooling = None
     decoder_output: CLIPSegDecoderOutput = None
+    log_probs: torch.FloatTensor = None
 
     def to_tuple(self) -> Tuple[Any]:
         return tuple(
@@ -1403,6 +1405,7 @@ class TextOrientedImageGeneration(nn.Module):
         )
 
         self.len_seg = self.config.codebook_config.embedding_dim
+        self.apply_weight = self.config.physical_config.apply_weight
 
         self.siso = self.config.physical_config.SISO
         self.physical_layer = PhysicalLayerModule(self.config.physical_config, device=device)
@@ -1477,6 +1480,7 @@ class TextOrientedImageGeneration(nn.Module):
         return_dict: Optional[bool] = None,
         stage: Optional[int] = 0,
         textalign: Optional[bool] = True,
+        sample_weight: Optional[bool] = False,
     ) -> Union[Tuple, CLIPSegOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1562,6 +1566,7 @@ class TextOrientedImageGeneration(nn.Module):
         transmitted_indices = []
         quantized_activations = []
         quantization_loss = 0
+        log_probs = 0
         
         for i, (activation, reduce) in enumerate(zip(activations, self.reduces)):
             activation = reduce(activation)
@@ -1587,8 +1592,23 @@ class TextOrientedImageGeneration(nn.Module):
             if self.siso:
                 received = self.physical_layer(transmitted_indices)
             else:
-                importance_weight = self.weight_module(local_embeddings, self.len_seg)
-                received = self.physical_layer(transmitted_indices, importance_weight)  #  [B, len, group] recovered indices
+                if self.apply_weight==1:
+                    # learned, context-dependent weights
+                    importance_weight, log_probs = self.weight_module(local_embeddings, self.len_seg, sample_weight)
+                else:
+                    # uniform weights: one weight per (batch, position, group)
+                    L, B, N, D = local_embeddings.shape
+                    # number of groups = number of layers × (D // seg)
+                    group = L * (D // self.len_seg)
+                    # make a [B, N, group] tensor of ones
+                    importance_weight = torch.ones(B, N, group, device=local_embeddings.device)
+                    # normalize so each row sums to 1
+                    importance_weight = importance_weight / importance_weight.sum(dim=-1, keepdim=True)
+                if not self.training:
+                    with torch.enable_grad():
+                        received = self.physical_layer(transmitted_indices, importance_weight)  #  [B, len, group] recovered indices
+                else:
+                    received = self.physical_layer(transmitted_indices, importance_weight)  #  [B, len, group] recovered indices
         recovered_embedding = self.quantizer.recover_embeddings(received)
         
         # STE: replace hard recovered with soft quantized during backward
@@ -1631,6 +1651,7 @@ class TextOrientedImageGeneration(nn.Module):
             pooled_output=pooled_output,
             vision_model_output=vision_outputs,
             decoder_output=decoder_outputs,
+            log_probs=log_probs,
         )
 
 class _NoDetachEmbed(nn.Module):
@@ -2047,6 +2068,7 @@ class VQAWithSegmentation(nn.Module):
         
         self.device = device
         self.processor = AutoProcessor.from_pretrained("CIDAS/clipseg-rd64-refined", do_rescale=False)
+        self.apply_weight = config.physical_config.apply_weight
         
         # Initialize VGG perceptual loss
         self.vgg_loss = VGGPerceptualLoss(
@@ -2098,7 +2120,7 @@ class VQAWithSegmentation(nn.Module):
         
         # Move all inputs to device
         inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-        outputs = self.image_generation_model(**inputs, stage=stage, textalign=textalign)
+        outputs = self.image_generation_model(**inputs, stage=stage, textalign=textalign, sample_weight=False)
         generated_images = outputs.logits  # Keep batch dimension
         quantization_loss = outputs.quantization_loss
         
@@ -2121,11 +2143,80 @@ class VQAWithSegmentation(nn.Module):
         vgg_loss = self.vgg_loss(generated_images, images)
         
         return {
+            'log_probs': outputs.log_probs,
             'generated_images': outputs.logits,
             'loss_recon': recon_loss,
             'loss_perc': perceptual_loss,
             'loss_vgg': vgg_loss,
             'quantization_loss': quantization_loss,
+        }
+    def forward_with_regret(self,images, questions, answer, stage=None, textalign=True):
+        # Process images and text separately
+        image_inputs = self.processor.image_processor(
+            images=images,
+            return_tensors="pt"
+        )
+        
+        # Process text with padding and truncation
+        text_inputs = self.processor.tokenizer(
+            questions,
+            padding=True,
+            truncation=True,
+            max_length=77,  # CLIP's max context length
+            return_tensors="pt"
+        )
+        
+        # Combine inputs
+        inputs = {
+            **image_inputs,
+            **text_inputs
+        }
+
+        # Move all inputs to device
+        inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+
+        # --- 1. Sample-weight branch ---
+        outputs_sample  = self.image_generation_model(**inputs,
+                                                    stage=stage,
+                                                    textalign=textalign,
+                                                    sample_weight=True)
+        gen_images_sample = outputs_sample.logits.detach()                     # [B, ...]
+        quant_loss_sample = outputs_sample.quantization_loss.detach()         # scalar or [B]
+        log_probs = outputs_sample.log_probs  
+        with torch.no_grad():                              # [B * ...]
+            recon_loss_sample = self.recon_loss(gen_images_sample, images)
+            perc_loss_sample = self.perceptual_model(images,
+                                                    gen_images_sample,
+                                                    questions)['loss_perc']
+            vgg_loss_sample  = self.vgg_loss(gen_images_sample, images)
+
+        # --- 2. Deterministic-weight branch ---
+        outputs_det = self.image_generation_model(**inputs,
+                                                stage=stage,
+                                                textalign=textalign,
+                                                sample_weight=False)
+        gen_images_det = outputs_det.logits.detach()                          # [B, ...]
+        quant_loss_det = outputs_det.quantization_loss.detach()               # scalar or [B]
+        with torch.no_grad():
+            recon_loss_det = self.recon_loss(gen_images_det, images)
+            perc_loss_det = self.perceptual_model(images,
+                                                gen_images_det,
+                                                questions)['loss_perc']
+            vgg_loss_det  = self.vgg_loss(gen_images_det, images)
+
+        # Return both sets of outputs for regret computation
+        return {
+            'log_probs':           log_probs,
+            'generated_images_sample':     gen_images_sample,
+            'loss_recon_sample':           recon_loss_sample,
+            'loss_perc_sample':            perc_loss_sample,
+            'loss_vgg_sample':             vgg_loss_sample,
+            'quantization_loss_sample':    quant_loss_sample,
+            'generated_images_det':        gen_images_det,
+            'loss_recon_det':              recon_loss_det,
+            'loss_perc_det':               perc_loss_det,
+            'loss_vgg_det':                vgg_loss_det,
+            'quantization_loss_det':       quant_loss_det,
         }
 
 __all__ = [
@@ -2312,56 +2403,87 @@ class WeightingModule(nn.Module):
     def __init__(self, input_dim, hidden_dim=64):
         """
         Args:
-            input_dim (int): Dimension of the token embedding (should equal seg).
-            hidden_dim (int): Hidden size of the network.
+            input_dim (int): Dimension of the token embedding (equal to seg).
+            hidden_dim (int): Hidden size for conv and linear layers.
         """
         super().__init__()
-        self.policy = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()  # Outputs importance weights in (0, 1)
-        )
+        # store input_dim (seg) for reference
+        self.input_dim = input_dim
+        # two 1D convolution layers over the segment dimension
+        self.conv1 = nn.Conv1d(in_channels=input_dim, out_channels=hidden_dim, kernel_size=1)
+        self.conv2 = nn.Conv1d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1)
+        # fully connected layers to produce a single score per group
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1)
+        self.sigmoid = nn.Sigmoid()
+        # buffer to store log probabilities when sampling
+        self.register_buffer('log_probs_buffer', None)
+        self.apply(self._init_weights)
 
-    def forward(self, embeddings, seg):
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, nn.Conv1d):
+            # Kaiming init for ReLU activations
+            nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Linear):
+            # Xavier init for linear layers
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, embeddings, seg, sample: bool = False):
         """
         Args:
-            embeddings: Tensor of shape [L, B, len, D], where
-                        L = number of layers,
+            embeddings: Tensor of shape [L, B, N, D], where:
+                        L = # layers,
                         B = batch size,
-                        len (N) = sequence length,
+                        N = sequence length,
                         D = token dimension.
-            seg: An integer factor such that D is divisible by seg.
+            seg: int divisor for D (must equal self.input_dim).
+            sample: bool, if True sample via Dirichlet; else return mode.
         Returns:
-            importance_weights: Tensor of shape [L, B, len]
-                                (one importance weight per layer, per sample, per token position)
+            weights: Tensor of shape [B, N, G]
+                     (continuous weights that sum to 1 over G groups).
         """
         L, B, N, D = embeddings.shape
-        assert D % seg == 0, "D must be divisible by seg."
+        assert D % seg == 0 and seg == self.input_dim, "D must be divisible by seg and seg must match input_dim."
 
-        # Step 1. Permute to bring batch and sequence dimensions together:
-        # From [L, B, N, D] to [B, N, L, D]
-        x = embeddings.permute(1, 2, 0, 3)  # shape: [B, N, L, D]
+        # reshape to [B*N, G, seg]
+        x = embeddings.permute(1, 2, 0, 3)     # [B, N, L, D]
+        x = x.view(B, N, L, D // seg, seg)     # [B, N, L, D//seg, seg]
+        G = L * (D // seg)
+        x_flat = x.reshape(B * N, G, seg)         # [B*N, G, seg]
 
-        # Step 2. Reshape D into two factors: (D // seg) and seg.
-        x = x.view(B, N, L, D // seg, seg)  # shape: [B, N, L, D//seg, seg]
+        # conv layers: expect [batch, channels, length]
+        x_conv = x_flat.permute(0, 2, 1)       # [B*N, seg, G]
+        h = F.relu(self.conv1(x_conv))        # [B*N, hidden_dim, G]
+        h = F.relu(self.conv2(h))             # [B*N, hidden_dim, G]
+        # transpose back to [batch, length, features]
+        h = h.permute(0, 2, 1)                 # [B*N, G, hidden_dim]
 
-        # Step 3. Combine the L and (D // seg) dimensions:
-        x = x.reshape(B, N, L * (D // seg), seg)  # shape: [B, N, L*(D//seg), seg]
+        # linear layers: per-group scoring
+        h_fc = F.relu(self.fc1(h))            # [B*N, G, hidden_dim]
+        scores = self.sigmoid(self.fc2(h_fc)).squeeze(-1)  # [B*N, G]
 
-        # Step 4. Merge B and N so that we can apply the policy network on each token of size seg.
-        x_flat = x.view(B * N, L * (D // seg), seg)  # shape: [B*N, L*(D//seg), seg]
+        # normalize scores into a distribution over groups
+        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-8)  # [B*N, G]
 
-        # Apply the policy network on each token.
-        # We flatten the last two dims so that each row is a token of dimension 'seg'
-        tokens = x_flat.contiguous()               # shape: [B*N, L*(D//seg), seg]
-        weights = self.policy(tokens)              # shape: [B*N, L*(D//seg), 1]
-        # Reshape back to [B*N, L*(D//seg)]
-        weights = weights.squeeze(-1)
+        if not sample:
+            # deterministic weights = Dirichlet mode
+            return probs, torch.zeros(B * N, device=probs.device)
 
-        # Normalize each row so that its sum equals 1.
-        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)
-        return weights
+        # sampling branch: Dirichlet draw
+        alpha = probs.clamp_min(1e-3)
+        dist = Dirichlet(alpha)
+        weights_flat = dist.rsample()            # [B*N, G]
+        # buffer the log-probabilities for policy-gradient
+        self.log_probs_buffer = dist.log_prob(weights_flat)  # [B*N]
+
+        # reshape back to [B, N, G]
+        return weights_flat, self.log_probs_buffer 
+
 
 def tensor_to_pil(img_tensor):
     # Ensure it's on CPU and detached

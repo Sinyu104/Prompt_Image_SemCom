@@ -38,6 +38,7 @@ class PhysicalConfig:
     num_clusters: int
     num_rays: int
     SISO:bool
+    apply_weight:int
 
 @dataclass
 class CodebookConfig:

@@ -5,6 +5,7 @@ __pycache__/
 # Virtual Environment
 env/
 prompt_image_segment/
+underwater_env/
 
 # IDE
 .idea/
@@ -27,6 +28,7 @@ plot*
 copy_to_cc.sh
 channel_eval.py
 stored_data/
+underwater.py
 *.pth
 *.ckpt
 *.pt
@@ -40,6 +42,7 @@ logs/
 *.json
 *.jpg
 *.jpeg
+*.eps
 *.png
 *.npy
 *.npz

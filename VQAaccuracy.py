@@ -15,7 +15,7 @@ transformers.logging.disable_progress_bar()
 warnings.filterwarnings("ignore")
 
 # ========== Device setup ==========
-torch.set_default_device("cuda:1" if torch.cuda.is_available() else "cpu")
+torch.set_default_device("cuda:2" if torch.cuda.is_available() else "cpu")
 
 # ========== Model & tokenizer ==========
 model = AutoModelForCausalLM.from_pretrained(
@@ -128,6 +128,10 @@ correct, total = 0, 0
 for entry in questions:
     img_id   = entry["image_id"]
     question = entry["question"]
+    if img_id == 103757:
+        question = "What color is the tag on the cat?"
+    else:
+        continue 
 
     # file names
     coco_path = os.path.join(coco_dir, f"COCO_val2014_{img_id:012}.jpg")
@@ -144,7 +148,7 @@ for entry in questions:
     out_ids = model.generate(
         input_ids,
         images=coco_img,
-        max_new_tokens=10,
+        max_new_tokens=20,
         pad_token_id=tokenizer.eos_token_id,
         use_cache=True,
         do_sample=False,
@@ -155,7 +159,7 @@ for entry in questions:
     out_ids = model.generate(
         input_ids,
         images=recon_img,
-        max_new_tokens=10,
+        max_new_tokens=20,
         pad_token_id=tokenizer.eos_token_id,
         use_cache=True,
         do_sample=False,
